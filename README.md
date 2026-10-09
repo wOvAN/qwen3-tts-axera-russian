@@ -25,8 +25,8 @@ Text ──────────────┤  Tokenizer + Embed  ├──
                             │ unix socket
          ┌──────────────────▼──────────────────┐
          │    vocoder_server.py                 │
-         │    ONNX FP32 (A76, 4 threads)       │
-         │    overlap-crossfade for chunks      │
+         │    RKNN FP16 (NPU, 3 cores)          │
+         │    context-conditioned chunk seams   │
          └──────────────────────────────────────┘
 ```
 
@@ -66,6 +66,31 @@ A76 cores from the code predictor. That is why streaming now wins. Deploy:
 `python3 scripts/convert_vocoder_rknn.py --model vocoder_traced_64.onnx` (no `--quantize`), point
 `VOCODER_MODEL` at the result, and export `PYTHONPATH=dual_npu/rknnlite_shim` (the shim provides
 the `RKNNLite` API over `librknnrt.so` for board Pythons newer than the lite2 wheels).
+
+### Vocoder chunk seams
+
+The WavTokenizer decoder is **causal**, so a token voiced at a chunk start with zero padding is a
+*different waveform* than the same token voiced mid-sequence (measured: corr 0.445, SNR 0.3 dB).
+The original 16-token zero-pad overlap crossfade therefore blended two unaligned signals — an
+audible "double voice" at every boundary. Chunking now works in layers, each measured against a
+single 256-token ONNX run of the same codes:
+
+- **Real context, not padding**: prepend the previous chunk's tail tokens (48 for the 112-slot
+  model; short tail chunks fill every free slot with context) and trim their audio. Boundary SNR:
+  4.1 dB @16 ctx → 9.9 @32 → 19.1 @48 → 19.8 @60 (saturates; the receptive field is far wider).
+- **Seams in pauses**: adjacent segments cannot be crossfaded (sum of 19 dB-decorrelated waves =
+  comb-filter crackle) and dropping speech is audible, so the seam *moves*: the longest contiguous
+  quiet run (≥150 ms, 20 ms-RMS < 25% of window RMS) in the last 3 s of a chunk becomes its end,
+  and `stitch()` fade-drops only silence there (equal-power cos/sin windows). Mid-phrase fallback:
+  20 ms equal-power micro-blend at the quietest point near the seam.
+- **Warmup-truncate** (CosyVoice-style overlap): each chunk decodes 2 tokens past its seam, the
+  next starts at the seam, and the shared region — which contains the contextless conv transient
+  at the next chunk's head — is dropped in the pause or blended at a loud seam. Seam
+  max|diff| vs the single-run reference: 97–108 m → 0.1–9.5 m.
+
+End to end (RKNN FP16, 112-slot): global SNR to the single-run reference 26–32 dB, seam-local
+25–57 dB; the residual is FP16 re-decode relaxation after each seam. A stateful conv-cache export
+(state as model I/O, no chunks at all) is the exact fix if that residual ever matters.
 
 ### Optimization Journey
 

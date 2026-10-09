@@ -25,8 +25,8 @@
                             │ unix socket
          ┌──────────────────▼──────────────────┐
          │    vocoder_server.py                 │
-         │    ONNX FP32 (A76, 4线程)           │
-         │    分块 overlap-crossfade            │
+         │    RKNN FP16 (NPU, 3 核)            │
+         │    真实上下文拼接分块接缝            │
          └──────────────────────────────────────┘
 ```
 
@@ -63,6 +63,27 @@
 部署：`python3 scripts/convert_vocoder_rknn.py --model vocoder_traced_64.onnx`（不加 `--quantize`），
 `VOCODER_MODEL` 指向结果，并设置 `PYTHONPATH=dual_npu/rknnlite_shim`（板载 Python 比 lite2 wheel
 更新时，由该 shim 通过 `librknnrt.so` 提供 `RKNNLite` API）。
+
+### 声码器分块接缝
+
+WavTokenizer 解码器是**因果的**：同一个 token 在零填充的块首和在序列中间解码出的波形*不同*
+（实测 corr 0.445，SNR 0.3 dB）。原来的 16-token 零填充 overlap-crossfade 混合了两条不对齐的
+波形——每个边界都有可听的"双声"。现在的分块策略分层实现，每层都与同一批 codes 的 256-token
+单次 ONNX 运行对比测量：
+
+- **真实上下文代替填充**：每块前拼接上一块的尾部 token（112 槽模型用 48；短的尾块用上下文填满
+  所有空槽），其音频裁掉。边界 SNR：16 ctx 时 4.1 dB → 32 时 9.9 → 48 时 19.1 → 60 时 19.8
+  （饱和；感受野远大于此）。
+- **接缝移入停顿**：相邻段不能 crossfade（19 dB 去相关波形相加 = 梳状滤波爆音），删语音又可听
+  见——所以接缝*移动*：块末 3 s 内最长的连续静音段（≥150 ms，20 ms-RMS < 窗口 RMS 的 25%）成为
+  块尾，`stitch()` 在那里只丢静音（cos/sin 等能量窗）。句中接缝退化为接缝附近最静点处 20 ms
+  等能量微混合。
+- **Warmup-truncate**（CosyVoice 式重叠）：每块多解码接缝之后 2 个 token，下一块从接缝开始，
+  共享区（含下一块块首无上下文卷积瞬态）在停顿中丢弃或在响接缝处混合。接缝 max|diff| 相对
+  单次参考：97–108 m → 0.1–9.5 m。
+
+端到端（RKNN FP16，112 槽）：对单次运行的全局 SNR 26–32 dB，接缝局部 25–57 dB；残余是接缝后
+的 FP16 重解码松弛。如需彻底消除——stateful conv-cache 导出（状态作为模型 I/O，不再有分块）。
 
 ### 优化历程
 
