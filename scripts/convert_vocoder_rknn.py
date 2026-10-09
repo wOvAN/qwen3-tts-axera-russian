@@ -31,6 +31,11 @@ def main():
     parser.add_argument("--output", default=None, help="Output RKNN path")
     parser.add_argument("--quantize", action="store_true",
                         help="Apply INT8 quantization")
+    parser.add_argument("--dataset", default=None,
+                        help="Calibration dataset file (one .npy [1,codes_length,16] per line). "
+                             "Random codes give audible noise (SNR 9.5 dB); record real vocoder "
+                             "requests for SNR 13.4 dB. FP16 (no --quantize) needs no calibration "
+                             "and is lossless (SNR 56.8 dB).")
     parser.add_argument("--target", default="rk3588",
                         choices=["rk3588", "rk3576"])
     parser.add_argument("--codes_length", type=int, default=None,
@@ -83,17 +88,21 @@ def main():
     if args.quantize:
         # Generate calibration data
         n_samples = 20
-        dataset_path = "/tmp/vocoder_calib_data.txt"
-        calib_dir = "/tmp/vocoder_calib"
-        os.makedirs(calib_dir, exist_ok=True)
+        dataset_path = args.dataset
+        if dataset_path is None:
+            dataset_path = "/tmp/vocoder_calib_data.txt"
+            calib_dir = "/tmp/vocoder_calib"
+            os.makedirs(calib_dir, exist_ok=True)
 
-        with open(dataset_path, "w") as f:
-            for i in range(n_samples):
-                npy_path = os.path.join(calib_dir, f"sample_{i}.npy")
-                data = np.random.randint(0, 2048,
-                    (1, args.codes_length, 16), dtype=np.int64)
-                np.save(npy_path, data)
-                f.write(f"{npy_path}\n")
+            with open(dataset_path, "w") as f:
+                for i in range(n_samples):
+                    npy_path = os.path.join(calib_dir, f"sample_{i}.npy")
+                    data = np.random.randint(0, 2048,
+                        (1, args.codes_length, 16), dtype=np.int64)
+                    np.save(npy_path, data)
+                    f.write(f"{npy_path}\n")
+        else:
+            print(f"Calibration:  {dataset_path} (real data)")
 
         ret = rknn.build(do_quantization=True, dataset=dataset_path)
     else:

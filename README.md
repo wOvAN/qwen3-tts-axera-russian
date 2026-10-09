@@ -43,6 +43,30 @@ Tested on FriendlyElec CM3588 (RK3588 4xA76+4xA55, 32GB RAM):
 | Vocoder (ONNX FP32) | ~5.0s/64-tok | Overlap-crossfade for chunks |
 | **Total RTF** | | **2.0x** |
 
+Measured on a stock RK3588 board (4×A76 pinned, no Axera NPU, Russian text): RTF 3.9-4.4x as
+shipped. The code predictor then cost 199 ms per 15-step request; after removing the
+`ggml_cast(ffn_down, F32)` nodes from `qwen3-tts.cpp/src/tts_transformer.cpp` (the CPU backend
+takes F16/Q8_0 weights in `mul_mat` directly — a cast node dequantizes 12.6 MB per layer per
+step, 75 times per token) it is 64 ms, generation goes 4.5 → 11.5 tok/s and RTF lands at
+**2.6x**. Moving the vocoder to the RK3588 NPU as **RKNN FP16** (lossless, SNR 56.8 dB — see
+below) takes streaming to **RTF 1.8x** (generation 8.9 tok/s concurrent with vocoding, first
+chunk ~3 s).
+
+### Vocoder: FP32 ONNX on CPU vs RKNN on NPU
+
+The vocoder uses **Snake activation** (`x + sin²(α·x)/α`), which is fundamentally incompatible with *quantization*:
+- **RKNN Q8**: 1.75x faster but audible noise (SNR 9.5 dB with random calibration, 13.4 dB with real recorded requests)
+- **ONNX INT8**: 3x *slower* + poor quality (SNR 4.2 dB)
+- **AX650N NPU**: Conv1D dilation=9 not supported
+- **MNN GPU**: Shape broadcast error in SineGen
+
+**RKNN FP16 (`w16a16`) is not quantized and measures lossless** (SNR 56.8 dB, corr 1.0000 vs the
+FP32 reference) at 1.34x the 4-core CPU speed — and it runs on the NPU, so it no longer steals
+A76 cores from the code predictor. That is why streaming now wins. Deploy:
+`python3 scripts/convert_vocoder_rknn.py --model vocoder_traced_64.onnx` (no `--quantize`), point
+`VOCODER_MODEL` at the result, and export `PYTHONPATH=dual_npu/rknnlite_shim` (the shim provides
+the `RKNNLite` API over `librknnrt.so` for board Pythons newer than the lite2 wheels).
+
 ### Optimization Journey
 
 | Version | Code Predictor | Vocoder | RTF |
@@ -52,16 +76,6 @@ Tested on FriendlyElec CM3588 (RK3588 4xA76+4xA55, 32GB RAM):
 | + 2-thread ONNX CP | ONNX 2-thread (265ms) | RKNN Q8 | 4.4x |
 | + GGML Q4_0 CP | **GGML (55ms)** | RKNN Q8 | 2.2x |
 | + ONNX FP32 vocoder | GGML (55ms) | **ONNX FP32** | **2.0x** |
-
-### Why ONNX FP32 Vocoder (not RKNN Q8)?
-
-The vocoder uses **Snake activation** (`x + sin²(α·x)/α`) which is fundamentally incompatible with quantization:
-- **RKNN Q8**: 1.75x faster but audible noise (SNR 9.5 dB, corr 0.94)
-- **ONNX INT8**: 3x *slower* + poor quality (SNR 4.2 dB)
-- **AX650N NPU**: Conv1D dilation=9 not supported
-- **MNN GPU**: Shape broadcast error in SineGen
-
-All quantization paths exhausted — FP32 is the only option for acceptable quality.
 
 ## Quick Start
 
@@ -97,6 +111,10 @@ The pipeline supports three code predictor backends (auto-selected):
 4. Export code predictor: `python3 scripts/export_code_predictor_weights.py`
 5. Export vocoder: `python3 scripts/export_vocoder_traced.py`
 6. (Optional) Convert GGML code predictor: see [qwen3-tts.cpp](https://github.com/nickovchinnikov/qwen3-tts.cpp)
+7. (Recommended) Shrink + quantize the GGML code-predictor model:
+   `python3 scripts/quantize_code_predictor_gguf.py --in <f16.gguf> --out <cp-q8_0.gguf>` and point
+   `CP_GGML_MODEL` at it. Keeps only the tensors the code predictor reads and Q8_0-quantizes the
+   matmul weights: 1745 MB → 183 MB, code-predictor RSS 1764 → 217 MB on RK3588, speed unchanged.
 
 See [docs/MODEL_CONVERSION.md](docs/MODEL_CONVERSION.md) for details.
 

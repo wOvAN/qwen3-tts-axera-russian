@@ -43,6 +43,27 @@
 | 声码器 (ONNX FP32) | ~5.0s/64-tok | Overlap-crossfade |
 | **总 RTF** | | **2.0x** |
 
+在纯 RK3588 板卡上实测（4×A76 绑核，无 Axera NPU，俄语文本）：原样是 RTF 3.9-4.4x。
+当时 code predictor 每个 15 步请求耗时 199 ms；删掉
+`qwen3-tts.cpp/src/tts_transformer.cpp` 里的 `ggml_cast(ffn_down, F32)` 节点后（ggml CPU 后端的
+`mul_mat` 可直接吃 F16/Q8_0 权重；cast 节点每层每步反量化 12.6 MB，每个 token 重复 75 次）
+降到 64 ms，生成速度 4.5 → 11.5 tok/s，**RTF 2.6x**。把声码器以 **RKNN FP16** 移到 RK3588 NPU
+后（无损，SNR 56.8 dB，见下文），流式模式达到 **RTF 1.8x**（生成与声码并行 8.9 tok/s，首个分块约 3 s）。
+
+### 声码器：CPU 上的 FP32 ONNX vs NPU 上的 RKNN
+
+声码器使用 **Snake 激活函数** (`x + sin²(α·x)/α`)，与*量化*根本不兼容:
+- **RKNN Q8**: 快 1.75 倍但有可听噪声（随机标定 SNR 9.5 dB，真实录音标定 13.4 dB）
+- **ONNX INT8**: 慢 3 倍且质量差（SNR 4.2 dB）
+- **AX650N NPU**: 不支持 Conv1D dilation=9
+- **MNN GPU**: SineGen 形状广播错误
+
+**RKNN FP16 (`w16a16`) 不是量化，实测无损**：相对 FP32 参考 SNR 56.8 dB、corr 1.0000，速度是
+4 核 CPU 的 1.34 倍——而且跑在 NPU 上，不再和 code predictor 抢 A76 核心，所以流式模式现在更快。
+部署：`python3 scripts/convert_vocoder_rknn.py --model vocoder_traced_64.onnx`（不加 `--quantize`），
+`VOCODER_MODEL` 指向结果，并设置 `PYTHONPATH=dual_npu/rknnlite_shim`（板载 Python 比 lite2 wheel
+更新时，由该 shim 通过 `librknnrt.so` 提供 `RKNNLite` API）。
+
 ### 优化历程
 
 | 版本 | Code Predictor | 声码器 | RTF |
@@ -50,16 +71,6 @@
 | 基线 (RKLLM talker) | ONNX 单线程 (374ms) | RKNN Q8 | 5.5x |
 | + GGML Q4_0 CP | **GGML (55ms)** | RKNN Q8 | 2.2x |
 | + ONNX FP32 声码器 | GGML (55ms) | **ONNX FP32** | **2.0x** |
-
-### 为什么使用 ONNX FP32 声码器？
-
-声码器使用 **Snake 激活函数** (`x + sin²(α·x)/α`)，与量化不兼容:
-- **RKNN Q8**: 快 1.75 倍但有可听噪声
-- **ONNX INT8**: 慢 3 倍且质量差
-- **AX650N NPU**: 不支持 Conv1D dilation=9
-- **MNN GPU**: SineGen 形状广播错误
-
-所有量化路径已穷尽 — FP32 是唯一可接受的方案。
 
 ## 快速开始
 
@@ -86,6 +97,11 @@ python3 dual_npu/tts_client.py "长文本..." --language chinese --streaming
 | **GGML Q4_0**（默认）| 55ms/步 | 需要 [qwen3-tts.cpp](https://github.com/nickovchinnikov/qwen3-tts.cpp) |
 | C++ ONNX Runtime | 240ms/步 | 内置, `dual_npu/code_predictor_cpp/` |
 | Python ONNX Runtime | 248ms/步 | 回退方案，无需编译 |
+
+GGML 后端需要的量化模型仓库里没有现成生产者（`llama-quantize` 不认识 `qwen3-tts` 架构）：
+用 `python3 scripts/quantize_code_predictor_gguf.py --in <f16.gguf> --out <cp-q8_0.gguf>`
+生成，只保留 code predictor 读取的张量并把 matmul 权重量化成 Q8_0。RK3588 实测：
+1745 MB → 183 MB，CP 服务进程 RSS 1764 → 217 MB，速度不变。
 
 ## 与 CosyVoice3 对比
 
