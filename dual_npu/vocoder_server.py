@@ -18,6 +18,7 @@ Usage on CM3588:
 """
 
 import os
+import re
 import sys
 import socket
 import struct
@@ -28,6 +29,90 @@ import numpy as np
 
 SAMPLE_RATE = 24000
 SAMPLES_PER_TOKEN = 1920
+
+
+def find_pause(x, min_len=3600, win=480):
+    """Center index of the longest run of 20 ms-RMS below 25% of the window
+    RMS, or None. A plain argmin finds stop-consonant closures (0 ms wide)
+    and the seam then eats a consonant; requiring a long quiet run finds a
+    real pause."""
+    if len(x) < 2 * win:
+        return None
+    r = np.sqrt(np.convolve(np.square(x), np.ones(win, dtype=np.float32) / win,
+                            mode='same'))
+    thr = 0.25 * float(np.sqrt(np.mean(np.square(x)))) + 1e-9
+    quiet = (r < thr).astype(np.int8)
+    edges = np.flatnonzero(np.diff(np.concatenate(([0], quiet, [0]))))
+    runs = edges[1::2] - edges[::2]
+    if len(runs) == 0:
+        return None
+    i = int(np.argmax(runs))
+    if runs[i] < min_len:
+        return None
+    return int(edges[i] + runs[i] // 2)
+
+
+def stitch(a, b, Wmax=SAMPLE_RATE, K=480, Fd=960, Fm=480, G=2400,
+           overlap=0):
+    """Join two audio segments. `overlap` samples of b repeat the tail of a
+    (warmup-truncate: the next chunk starts a few tokens before a's audio
+    ends, so the contextless conv transient at b's head is inside the
+    shared region and gets dropped/blended away).
+
+    The segments are temporally adjacent (no shared content), so a long
+    crossfade beats (waveforms do not align — context conditioning leaves
+    ~19 dB mismatch at the join) and a fixed fade-drop is audible when it
+    eats speech. Strategy:
+      1. Search a real pause (minimum 20 ms-RMS point) within 1 s of the
+         seam in each segment. If what would be dropped there is quiet
+         (<25% of the local RMS), fade-drop-stitch inside the pause.
+      2. Otherwise (seam mid-phrase) do a 20 ms equal-power micro-blend
+         centered on the quietest sample within +-50 ms of the seam:
+         amplitude-continuous, energy-preserving (linear windows dip in the
+         middle = audible crackle), no samples dropped.
+    """
+    W = min(Wmax, len(a) // 2, len(b) // 2)
+    if W < K + Fd:
+        return np.concatenate([a, b])
+
+    def rms(x):
+        return float(np.sqrt(np.mean(np.square(x)))) if len(x) else 0.0
+
+    def quietest(x):
+        e = np.convolve(x * x, np.ones(K, dtype=np.float32) / K, mode='same')
+        return int(np.argmax(e))
+
+    m = len(a) - W + quietest(a[-W:])
+    n = quietest(b[:W])
+    drop = np.concatenate([a[m:], b[:n]])
+    local = max(rms(a[-W:]), rms(b[:W]), 1e-9)
+    if rms(drop) < 0.25 * local:
+        t = np.linspace(0.0, 1.0, Fd, dtype=np.float32)
+        fo = np.cos(t * np.pi / 2)
+        return np.concatenate([
+            a[:m], a[m:m + Fd] * fo, b[n:n + Fd] * (1.0 - fo), b[n + Fd:]])
+
+    L = len(a)
+    bo = b[overlap:] if len(b) > overlap + 2 * Fm else b
+    out = np.concatenate([a, bo])
+    c0 = max(Fm, L - G // 2)
+    c1 = min(len(out) - Fm, L + G // 2)
+    seg = out[c0 - Fm:c1 + Fm]
+    e = np.convolve(seg * seg, np.ones(120, dtype=np.float32) / 120,
+                    mode='same')
+    c = min(max(c0 - Fm + int(np.argmax(e)), L - Fm + 10), L + Fm - 10)
+    t = np.linspace(0.0, 1.0, 2 * Fm, dtype=np.float32)
+    w = np.cos(t * np.pi / 2)
+    ae = np.zeros(2 * Fm, dtype=np.float32)
+    be = np.zeros(2 * Fm, dtype=np.float32)
+    a1 = min(len(a), c + Fm)
+    ae[:a1 - (c - Fm)] = a[c - Fm:a1]
+    b0 = max(0, c - L - Fm)
+    b1 = min(len(bo), c - L + Fm)
+    k0 = 2 * Fm - (b1 - b0)
+    be[k0:k0 + (b1 - b0)] = bo[b0:b1]
+    out[c - Fm:c + Fm] = ae * w + be * (1.0 - w)
+    return out
 
 
 class VocoderServer:
@@ -54,7 +139,8 @@ class VocoderServer:
             ret = self.rknn.init_runtime(core_mask=RKNNLite.NPU_CORE_0_1_2)
             if ret != 0:
                 raise RuntimeError(f"Failed to init RKNN vocoder: {ret}")
-            self.max_tokens = 64 if "64" in os.path.basename(model_path) else 256
+            m = re.search(r"_(\d+)", os.path.basename(model_path))
+            self.max_tokens = int(m.group(1)) if m else 256
             print(f"Vocoder: RKNN NPU, max_tokens={self.max_tokens}")
 
         self._running = True
@@ -80,43 +166,52 @@ class VocoderServer:
             audio = self._inference_chunk(padded)
             return audio[:n_tokens * SAMPLES_PER_TOKEN]
 
-        # Multi-chunk with overlap-crossfade to avoid boundary artifacts
-        OVERLAP = 16  # tokens of overlap between chunks
-        OVERLAP_SAMPLES = OVERLAP * SAMPLES_PER_TOKEN
-        step = self.max_tokens - OVERLAP  # 56 tokens advance per chunk
-
+        # Multi-chunk. The WavTokenizer decoder is causal, so the same tokens
+        # voiced at a chunk start with zero padding are a *different waveform*
+        # than voiced mid-sequence with real context (measured: corr 0.445,
+        # SNR 0.3 dB). The old zero-pad 16-token overlap crossfade therefore
+        # blended two unaligned signals — audible "double voice" at every
+        # boundary. Feed the previous chunk's tail as real context instead.
+        # Boundary SNR (first 0.1 s of the new region vs single full run,
+        # RKNN FP16): CTX=16 -> 4.1 dB (audible), CTX=48 -> 18.6 dB,
+        # CTX=60 -> 20.2 dB (saturating).
+        #
+        # Even at 19 dB the two waveforms are not phase-aligned, so *any*
+        # sum at a mid-phrase seam combs (audible crackle) and any drop of
+        # speech is audible as a dropout. So move the seam to a pause:
+        # after each chunk, find its quietest 100 ms window in the last 1.5 s
+        # and start the next chunk there; stitch() then drops only silence.
+        CTX = max(16, self.max_tokens - 64)  # tokens of real context per chunk
+        N_NEW = self.max_tokens - CTX        # new tokens voiced per chunk
         result = np.array([], dtype=np.float32)
-        chunk_start = 0
-
-        while chunk_start < n_tokens:
-            chunk_end = min(chunk_start + self.max_tokens, n_tokens)
-            chunk_len = chunk_end - chunk_start
+        pos = 0
+        while pos < n_tokens:
+            take = codes_array[pos:pos + N_NEW]
+            # fill every slot the chunk does not need with real context: a
+            # short (tail) chunk gets 94 tokens of context instead of 48,
+            # halving the conditioning deficit at the last seam
+            ctx = codes_array[max(0, pos - (self.max_tokens - len(take))):pos]
+            seg = np.concatenate([ctx, take])
             padded = np.zeros((1, self.max_tokens, 16), dtype=np.int64)
-            padded[0, :chunk_len, :] = codes_array[chunk_start:chunk_end, :16]
-
-            audio_chunk = self._inference_chunk(padded)
-            actual_samples = chunk_len * SAMPLES_PER_TOKEN
-            audio_chunk = audio_chunk[:actual_samples]
-
-            if chunk_start == 0:
-                # First chunk: keep all audio
-                result = audio_chunk
-            else:
-                # Crossfade overlap region
-                if len(result) >= OVERLAP_SAMPLES and len(audio_chunk) >= OVERLAP_SAMPLES:
-                    fade_out = np.linspace(1.0, 0.0, OVERLAP_SAMPLES, dtype=np.float32)
-                    fade_in = 1.0 - fade_out
-                    blended = (result[-OVERLAP_SAMPLES:] * fade_out +
-                               audio_chunk[:OVERLAP_SAMPLES] * fade_in)
-                    result = np.concatenate([
-                        result[:-OVERLAP_SAMPLES],
-                        blended,
-                        audio_chunk[OVERLAP_SAMPLES:]
-                    ])
-                else:
-                    result = np.concatenate([result, audio_chunk])
-
-            chunk_start += step
+            padded[0, :len(seg), :] = seg[:, :16]
+            audio = self._inference_chunk(padded)[
+                len(ctx) * SAMPLES_PER_TOKEN:len(seg) * SAMPLES_PER_TOKEN].copy()
+            seam = pos + len(take)
+            if pos + len(take) < n_tokens:
+                Ws = int(3.0 * SAMPLE_RATE)
+                if len(audio) > Ws + 2400:
+                    k = find_pause(audio[-Ws:])
+                    if k is not None:
+                        seam = pos + len(take) - (Ws - k) // SAMPLES_PER_TOKEN
+                        seam = max(pos + 8, min(seam, pos + len(take) - 2))
+                # warmup-truncate: keep 2 tokens past the seam (this chunk
+                # decodes them mid-region, clean) so the next chunk can
+                # drop its contextless head transient inside the overlap
+                audio = audio[:(seam - pos) * SAMPLES_PER_TOKEN
+                              + 2 * SAMPLES_PER_TOKEN]
+            result = (stitch(result, audio, overlap=2 * SAMPLES_PER_TOKEN)
+                      if len(result) else audio)
+            pos = seam if seam > pos else n_tokens
 
         return result
 
