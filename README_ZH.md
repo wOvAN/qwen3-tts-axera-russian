@@ -26,7 +26,7 @@
          ┌──────────────────▼──────────────────┐
          │    vocoder_server.py                 │
          │    RKNN FP16 (NPU, 3 核)            │
-         │    真实上下文拼接分块接缝            │
+         │    有状态流式，无接缝                │
          └──────────────────────────────────────┘
 ```
 
@@ -83,7 +83,64 @@ WavTokenizer 解码器是**因果的**：同一个 token 在零填充的块首�
   单次参考：97–108 m → 0.1–9.5 m。
 
 端到端（RKNN FP16，112 槽）：对单次运行的全局 SNR 26–32 dB，接缝局部 25–57 dB；残余是接缝后
-的 FP16 重解码松弛。如需彻底消除——stateful conv-cache 导出（状态作为模型 I/O，不再有分块）。
+的 FP16 重解码松弛。彻底的解法是下面的有状态导出——它根本没有接缝；分块方案保留为无 NPU 部署的
+回退路径。
+
+### 声码器：有状态流式（无分块）
+
+WavTokenizer v2 解码器**完全因果**，所以它的全部历史可以放进模型自身的 I/O，而不必每个分块重新
+喂入。`scripts/export_vocoder_stateful.py` 导出一个流式步：所有因果卷积的尾部（`(k-1)*d` 个输入，
+转置卷积为 `ceil((k-1)/s)`）以及 pre-transformer 的滑动窗口 KV（71 个 key × 8 层 × 2 × 16 头 × 64）
+打包进**一个扁平 float32 缓存张量——1303424 个数，5.2 MB——它既是输入也是输出**：
+
+```
+audio_codes [1,16,64] int64 ─┐
+freqs_in    [64,32]   fp32  ─┤→ 一步 →  audio_values [1,122880]  （64 token = 5.12 秒 24 kHz）
+cache_valid [1]       fp32  ─┤          cache_out   [1303424] fp32
+cache_in    [1303424] fp32  ─┘
+```
+
+各处形状都是固定的，所以转换方式与任何声码器模型相同：
+
+```bash
+python3 scripts/export_vocoder_stateful.py --codes-length 64 \
+    --output models/vocoder_stateful_64.onnx
+python3 scripts/convert_vocoder_rknn.py --model models/vocoder_stateful_64.onnx --stateful \
+    --output models/vocoder_stateful_64_fp16.rknn
+# 板端：VOCODER_MODEL=/root/tts-rknn/vocoder/vocoder_stateful_64_fp16.rknn（文件名必须含
+#       'stateful'——服务器和客户端就是靠它选择流式路径）
+```
+
+协议（同一 socket，无新操作码）：服务器**缓冲**请求里的 token，只在凑满 64 个一组时前进，因此
+请求边界落在组中间时绝不做零填充（零填充会把静音写进缓存——仅此一项端到端就损失 25 dB）。
+`n_tokens=0` 的请求就是 **flush**：把剩余的不足 64 个 token 发声并返回其音频，然后清零状态。客户端
+在一句话开始时发一次该 reset（空 flush），最后一个分块之后再发一次，然后把各段直接拼接——不
+stitch、不 overlap、无接缝。
+
+NPU 的 fp16 构建强制了四个不显然的选择，每个都经过测量：
+
+- **RoPE 角度作为宿主输入，cos/sin 在图内计算。** 把 cos/sin 作为输入喂入会让 fp16 流水线爆炸
+  （q 的 rms 0.68 → 120）。原始角度 `pos*inv_freq` 可达 ~1e4，那里 fp16 ulp 是 0.5，所以宿主先对
+  2π 取模（值 ≤ 6.28，ulp 0.004）。
+- **attention mask 是图内常量，取值 −100**，建立在*相对*网格（`qp-kp`）上，因此与步序号无关。
+  −3e4 会穿透 NPU 的 softmax（注意力变均匀）；而把绝对 mask 作为*输入*并与图内 cos/sin 同时使用，
+  会让板端运行时 SEGFAULT。
+- **缓存有效性是标量输入**（`cache_valid`：一句话的第一步为 0，之后为 1）。改从缓存数据推导它
+  （Abs/ReduceSum/Clip 偏置链）会损失 30 dB。
+- **KV 历史通过常量选择矩阵乘接入**（`A@cache_k + P@k`），而不是 Concat：RKNN 的 Concat 路径会
+  破坏滑动窗口注意力（9.5 dB 对 56.8 dB）。
+
+板端实测，同一段 200 token 俄语文本，`--streaming`，与同一批 codes 的 256-token ONNX FP32 单次
+运行对比：
+
+| 声码器 | 全局 SNR | 每 64 token 分区 | 生成速度 | 声码等待 | RTF |
+|---|---|---|---|---|---|
+| 分块接缝（112 槽） | 26.4 dB | 57.5 / 21.1 / 29.7 | 6.5 tok/s | 6.0 s | 2.6x |
+| **有状态流式** | **48.0 dB** | 56.2 / 44.5 / 51.1 / 53.4 | 7.5 tok/s | 0.0 s | **1.9x** |
+
+有状态方案在整句话中任何位置都不低于 44 dB（分块方案在第一个接缝之后就掉 30 dB），并且它不再从
+code predictor 手里抢 A76 核，所以生成本身也变快了。导出的 fp32 自检（逐步 vs 完整解码，
+`--check-only`）为 48.8 dB——那是 KV 选择矩阵乘的 fp32 累加噪声，不是语义错误。
 
 ### 优化历程
 
@@ -132,7 +189,7 @@ GGML 后端需要的量化模型仓库里没有现成生产者（`llama-quantize
 | 架构 | Talker → CP → Vocoder | LLM → Flow DiT → HiFT |
 | NPU (AX650N) | 未使用 | Flow DiT 运行在 NPU |
 
-CosyVoice3 更快，因为 Flow DiT（MatMul+Attention）运行在 AX650N NPU 上。Qwen3-TTS 没有适合 NPU 的组件。
+CosyVoice3 更快，因为 Flow DiT（MatMul+Attention）运行在 AX650N NPU 上。Qwen3-TTS 没有*适合量化*的 NPU 组件——声码器的 Snake 激活让 Q8/INT8 不可用——但未量化的 RKNN FP16 路径是无损的，所以声码器确实跑在 RKNN NPU 上（见上文）。
 
 ## 支持的语言
 

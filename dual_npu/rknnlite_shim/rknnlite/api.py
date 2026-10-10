@@ -50,7 +50,11 @@ _sig(_lib.rknn_outputs_get, [_u64, _u32, ctypes.POINTER(_Output),
                              ctypes.c_void_p])
 _sig(_lib.rknn_outputs_release, [_u64, _u32, ctypes.POINTER(_Output)])
 
+_TENSOR_FLOAT32 = 0
+_TENSOR_FLOAT16 = 1
 _TENSOR_INT64 = 8
+_TYPE_BY_DTYPE = {np.int64: _TENSOR_INT64, np.float32: _TENSOR_FLOAT32,
+                  np.float16: _TENSOR_FLOAT16}
 
 
 class RKNNLite:
@@ -81,10 +85,18 @@ class RKNNLite:
         return r
 
     def inference(self, inputs):
-        x = np.ascontiguousarray(inputs[0], dtype=np.int64)
-        inp = _Input(index=0, buf=x.ctypes.data, size=x.nbytes,
-                     pass_through=1, type=_TENSOR_INT64, fmt=0)
-        r = _lib.rknn_inputs_set(self.ctx, 1, ctypes.byref(inp))
+        n_in = len(inputs)
+        inp = (_Input * n_in)()
+        keep = []
+        for i, t in enumerate(inputs):
+            t = np.asarray(t)
+            dtype = (np.int64 if t.dtype == np.int64
+                     else np.float16 if t.dtype == np.float16 else np.float32)
+            x = np.ascontiguousarray(t, dtype=dtype)
+            keep.append(x)
+            inp[i] = _Input(index=i, buf=x.ctypes.data, size=x.nbytes,
+                            pass_through=1, type=_TYPE_BY_DTYPE[dtype], fmt=0)
+        r = _lib.rknn_inputs_set(self.ctx, n_in, inp)
         if r:
             raise RuntimeError(f"rknn_inputs_set: {r}")
         r = _lib.rknn_run(self.ctx, None)

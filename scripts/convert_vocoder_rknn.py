@@ -40,6 +40,17 @@ def main():
                         choices=["rk3588", "rk3576"])
     parser.add_argument("--codes_length", type=int, default=None,
                         help="Number of codec tokens (auto-detect from filename)")
+    parser.add_argument("--stateful", action="store_true",
+                        help="Stateful streaming export (export_vocoder_stateful.py): "
+                             "4 inputs audio_codes/freqs_in/cache_valid/cache_in, 2 outputs")
+    parser.add_argument("--cache-numel", type=int, default=1303424,
+                        help="Flat cache size in floats (stateful model)")
+    parser.add_argument("--head-dim", type=int, default=64,
+                        help="RoPE head dim (stateful model)")
+    parser.add_argument("--kv-len", type=int, default=71,
+                        help="KV cache history length (stateful model)")
+    parser.add_argument("--opt-level", type=int, default=1,
+                        help="RKNN graph optimization level")
     args = parser.parse_args()
 
     if not os.path.exists(args.model):
@@ -72,14 +83,30 @@ def main():
     rknn = RKNN(verbose=True)
 
     print("\n1. Configuring RKNN...")
-    rknn.config(target_platform=args.target, optimization_level=1)
+    rknn.config(target_platform=args.target,
+                optimization_level=args.opt_level)
 
     print("\n2. Loading ONNX model...")
-    ret = rknn.load_onnx(
-        model=args.model,
-        inputs=['audio_codes'],
-        input_size_list=[[1, args.codes_length, 16]],
-    )
+    if args.stateful:
+        # stateful export (export_vocoder_stateful.py): decoder-native
+        # [1, 16 codebooks, codes_length] codes, host-side RoPE angles
+        # freqs [B, head_dim/2] (mod 2*pi; cos/sin computed in-graph —
+        # cos/sin as inputs explodes on the NPU), flat cache; the attention
+        # mask is in-graph (constant window + cache-validity bias)
+        ret = rknn.load_onnx(
+            model=args.model,
+            inputs=['audio_codes', 'freqs_in', 'cache_valid', 'cache_in'],
+            input_size_list=[[1, 16, args.codes_length],
+                             [args.codes_length, args.head_dim // 2],
+                             [1],
+                             [args.cache_numel]],
+        )
+    else:
+        ret = rknn.load_onnx(
+            model=args.model,
+            inputs=['audio_codes'],
+            input_size_list=[[1, args.codes_length, 16]],
+        )
     if ret != 0:
         print(f"ERROR: Failed to load ONNX: {ret}")
         sys.exit(1)

@@ -26,7 +26,7 @@ Text ──────────────┤  Tokenizer + Embed  ├──
          ┌──────────────────▼──────────────────┐
          │    vocoder_server.py                 │
          │    RKNN FP16 (NPU, 3 cores)          │
-         │    context-conditioned chunk seams   │
+         │    stateful streaming (no seams)     │
          └──────────────────────────────────────┘
 ```
 
@@ -89,8 +89,68 @@ single 256-token ONNX run of the same codes:
   max|diff| vs the single-run reference: 97–108 m → 0.1–9.5 m.
 
 End to end (RKNN FP16, 112-slot): global SNR to the single-run reference 26–32 dB, seam-local
-25–57 dB; the residual is FP16 re-decode relaxation after each seam. A stateful conv-cache export
-(state as model I/O, no chunks at all) is the exact fix if that residual ever matters.
+25–57 dB; the residual is FP16 re-decode relaxation after each seam. The exact fix is the
+stateful export below — it has no seams at all, and this scheme stays as the fallback for
+boards without the NPU path.
+
+### Vocoder: stateful streaming (no chunks)
+
+The WavTokenizer v2 decoder is *fully causal*, so its whole history can live in the model's own
+I/O instead of being re-fed per chunk. `scripts/export_vocoder_stateful.py` exports one streaming
+step: every causal conv's tail (`(k-1)*d` inputs, `ceil((k-1)/s)` for the transposed convs) and the
+pre-transformer's sliding-window KV (71 keys × 8 layers × 2 × 16 heads × 64) are packed into **one
+flat float32 cache tensor — 1303424 floats, 5.2 MB — which is both an input and an output**:
+
+```
+audio_codes [1,16,64] int64 ─┐
+freqs_in    [64,32]   fp32  ─┤→ step →  audio_values [1,122880]  (64 tokens = 5.12 s of 24 kHz)
+cache_valid [1]       fp32  ─┤          cache_out   [1303424] fp32
+cache_in    [1303424] fp32  ─┘
+```
+
+Fixed shapes everywhere, so it converts like any other vocoder model:
+
+```bash
+python3 scripts/export_vocoder_stateful.py --codes-length 64 \
+    --output models/vocoder_stateful_64.onnx
+python3 scripts/convert_vocoder_rknn.py --model models/vocoder_stateful_64.onnx --stateful \
+    --output models/vocoder_stateful_64_fp16.rknn
+# board: VOCODER_MODEL=/root/tts-rknn/vocoder/vocoder_stateful_64_fp16.rknn (name must contain
+#        'stateful' — that is what selects the streaming path in server and client)
+```
+
+Protocol (same socket, no new opcodes): the server **buffers** request tokens and steps only on
+full 64-token groups, so a request boundary in the middle of a group never zero-pads (padding
+writes silence into the caches — that alone cost 25 dB end to end). A `n_tokens=0` request
+**flushes**: it voices the leftover < 64 tokens and returns their audio, then zeroes the state. The
+client sends that reset once at the start of an utterance (empty flush) and once after the last
+chunk, and concatenates the pieces — no stitch, no overlap, no seam.
+
+The NPU fp16 build forced four non-obvious choices, each measured:
+
+- **RoPE angles are host inputs, cos/sin are in-graph.** Feeding cos/sin as inputs explodes the
+  fp16 pipeline (q rms 0.68 → 120). Raw angles `pos*inv_freq` reach ~1e4, where fp16 ulp is 0.5,
+  so the host reduces them mod 2π (values ≤ 6.28, ulp 0.004).
+- **The attention mask is a graph constant at −100**, on the *relative* grid (`qp-kp`), so it is
+  step-index free. −3e4 leaks through the NPU softmax (attention goes uniform); and an absolute
+  mask fed as an *input* together with in-graph cos/sin segfaults the board runtime.
+- **Cache validity is a scalar input** (`cache_valid` = 0 on the first step of an utterance, 1
+  after). Deriving it from the cache data instead (an Abs/ReduceSum/Clip bias chain) costs 30 dB.
+- **KV history joins through constant selection matmuls** (`A@cache_k + P@k`), not Concat: the
+  RKNN Concat path corrupts sliding-window attention (9.5 dB vs 56.8 dB).
+
+Measured on the board, same 200-token Russian text, `--streaming`, vs a single 256-token ONNX FP32
+run of the *same* codes:
+
+| Vocoder | Global SNR | Per-64-token zones | Generation | Vocoder wait | RTF |
+|---|---|---|---|---|---|
+| chunked seams (112-slot) | 26.4 dB | 57.5 / 21.1 / 29.7 | 6.5 tok/s | 6.0 s | 2.6x |
+| **stateful streaming** | **48.0 dB** | 56.2 / 44.5 / 51.1 / 53.4 | 7.5 tok/s | 0.0 s | **1.9x** |
+
+The stateful run never drops below 44 dB anywhere in the utterance (the chunked scheme loses 30 dB
+past its first seam), and it stops stealing A76 cores from the code predictor, so generation itself
+gets faster. The fp32 self-check of the export (stepwise vs full decode, `--check-only`) is 48.8 dB
+— the kv-selection matmuls' fp32 accumulation noise, not a semantic error.
 
 ### Optimization Journey
 
@@ -135,6 +195,10 @@ The pipeline supports three code predictor backends (auto-selected):
 3. Extract embeddings: `python3 scripts/extract_embeddings.py`
 4. Export code predictor: `python3 scripts/export_code_predictor_weights.py`
 5. Export vocoder: `python3 scripts/export_vocoder_traced.py`
+5b. (Recommended, NPU) Export the **stateful streaming** vocoder and convert it:
+   `python3 scripts/export_vocoder_stateful.py --codes-length 64 --output models/vocoder_stateful_64.onnx`
+   then `python3 scripts/convert_vocoder_rknn.py --model models/vocoder_stateful_64.onnx --stateful`
+   — see [Vocoder: stateful streaming](#vocoder-stateful-streaming-no-chunks).
 6. (Optional) Convert GGML code predictor: see [qwen3-tts.cpp](https://github.com/nickovchinnikov/qwen3-tts.cpp)
 7. (Recommended) Shrink + quantize the GGML code-predictor model:
    `python3 scripts/quantize_code_predictor_gguf.py --in <f16.gguf> --out <cp-q8_0.gguf>` and point
@@ -157,7 +221,8 @@ See [docs/MODEL_CONVERSION.md](docs/MODEL_CONVERSION.md) for details.
 │   ├── code_predictor_weights.npz       # All weights (240 MB)
 │   └── code_predictor_decode_step.onnx  # ONNX model (314 MB)
 └── vocoder/
-    └── vocoder_traced_64.onnx           # Vocoder FP32 (93 MB)
+    ├── vocoder_traced_64.onnx           # Vocoder FP32 (93 MB)
+    └── vocoder_stateful_64_fp16.rknn    # Vocoder FP16, stateful streaming step (248 MB)
 ```
 
 ## Build llama_wrapper.so
@@ -181,7 +246,7 @@ gcc -shared -fPIC -O2 -o llama_wrapper.so llama_wrapper.c \
 | Audio quality | Good | Good |
 | Token rate | 12 Hz | 25 Hz |
 
-CosyVoice3 achieves better RTF because its Flow DiT (MatMul+Attention) runs on AX650N NPU, freeing CPU for LLM and HiFT. Qwen3-TTS has no NPU-friendly component — the vocoder uses Snake activation which is incompatible with all NPU/quantization paths.
+CosyVoice3 achieves better RTF because its Flow DiT (MatMul+Attention) runs on AX650N NPU, freeing CPU for LLM and HiFT. Qwen3-TTS has no NPU-friendly component *for quantization* — the vocoder's Snake activation is what kills Q8/INT8 — but the unquantized RKNN FP16 path is lossless, so the vocoder does run on the RKNN NPU (see above).
 
 ## Supported Languages
 

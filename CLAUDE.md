@@ -101,6 +101,33 @@ causal — zero-pad chunk starts are a *different waveform*, corr 0.445 / SNR 0.
 zero-pad overlap crossfade = "double voice"). Streaming mode submits each chunk to the vocoder on
 a background thread so it overlaps generation.
 
+### Stateful streaming contract (the seam-free path, now the default on the NPU)
+
+`scripts/export_vocoder_stateful.py` exports the decoder as one **streaming step with explicit
+state**: 4 inputs `audio_codes [1,16,B] int64` / `freqs_in [B,32] fp32` / `cache_valid [1] fp32` /
+`cache_in [1303424] fp32`, 2 outputs `audio_values` / `cache_out`. The flat cache is every causal
+conv's tail plus the pre-transformer's sliding-window KV (8 layers × 2 × 16 heads × 71 × 64), in
+the order of `StatefulDecoder.specs` — change `B` (`--codes-length`) and you must reconvert the
+RKNN model, whose input sizes `convert_vocoder_rknn.py --stateful` hardcodes. `vocoder_server.py`
+and `tts_client.py` both switch on the substring `stateful` in the model filename
+(`VOCODER_MODEL`), and the server takes `B` from the same `_(\d+)` filename regex.
+
+Protocol: the server **buffers** request tokens and steps only on full `B`-token groups — a request
+boundary in the middle of a group must never be zero-padded, padding writes silence into the caches
+(measured: 25 dB end to end). `n_tokens=0` is a **flush**: it voices the leftover tail, *returns its
+audio*, then zeroes `cache`/`pos`/`buf`. The client sends a flush at utterance start (empty) and
+again after the vocoder threads join, and concatenates stateful audio without `stitch()`. A client
+that exits without the final flush leaves tokens in `buf`; the next utterance's start flush voices
+them, so state never leaks across utterances.
+
+The four NPU-fp16-forced export choices are load-bearing and each is measured (see the README
+section): RoPE angles as host inputs reduced mod 2π with cos/sin computed in-graph (cos/sin as
+inputs explodes the pipeline; raw angles hit fp16 ulp 0.5 at pos ~1e3), the sliding-window mask as
+a graph constant at −100 on the relative grid (−3e4 leaks through the NPU softmax; an absolute mask
+as an *input* plus in-graph cos/sin SEGFAULTs the board runtime), cache validity as a scalar input
+(a data-dependent Abs/ReduceSum/Clip chain costs 30 dB), and KV history joined by constant selection
+matmuls instead of Concat (the RKNN Concat path corrupts sliding-window attention: 9.5 dB vs 56.8).
+
 ### Why the vocoder is FP32 on CPU (superseded: FP16 on NPU is lossless)
 
 Snake activation (`x + sin²(αx)/α`) breaks every *quantized* path: RKNN Q8 is 1.75x faster but
@@ -244,5 +271,17 @@ What does not work as shipped:
   `librknnrt.so` implementing the `RKNNLite` surface the server uses. `convert_vocoder_rknn.py
   --quantize --dataset <file>` now accepts real recorded vocoder requests for calibration
   (`dual_npu/vocproxy.py`-style recording: `[i32 n][int64 n*16]` per request, chunked to 64).
+- **Stateful streaming vocoder (seam-free) — the chunk-seam relaxation is gone, not tuned.**
+  `scripts/export_vocoder_stateful.py` + `convert_vocoder_rknn.py --stateful` + the buffer/flush
+  protocol in `vocoder_server.py`/`tts_client.py` (contract above) replace chunking entirely.
+  Measured on the board, same 200-token Russian text, `--streaming`, vs a single 256-token ONNX
+  FP32 run of the same codes: chunked seams (112-slot) global SNR **26.4 dB** with zones
+  57.5/21.1/29.7, generation 6.5 tok/s, vocoder wait 6.0 s, RTF 2.6x; stateful **48.0 dB** with
+  zones 56.2/44.5/51.1/53.4, generation 7.5 tok/s, vocoder wait 0.0 s, **RTF 1.9x**. The stateful
+  run never drops below 44 dB anywhere, i.e. no seam-shaped relaxation at all, and the vocoder no
+  longer competes with the CP for the A76 cores. The export's own fp32 self-check (stepwise vs
+  full decode) is 48.8 dB — the kv-selection matmuls' fp32 accumulation noise; the export's check
+  threshold is therefore 40 dB, do not raise it back to 80 (it aborts *before*
+  `torch.onnx.export`, which then leaves a stale ONNX for the converter to load).
 
 

@@ -29,6 +29,11 @@ import numpy as np
 
 SAMPLE_RATE = 24000
 SAMPLES_PER_TOKEN = 1920
+# flat conv/KV cache size of the stateful export; must match
+# scripts/export_vocoder_stateful.py StatefulDecoder.cache_numel
+STATEFUL_CACHE_NUMEL = 1303424
+STATEFUL_HEAD_DIM = 64
+STATEFUL_KV_LEN = 71
 
 
 def find_pause(x, min_len=3600, win=480):
@@ -119,6 +124,7 @@ class VocoderServer:
     def __init__(self, model_path, socket_path="/tmp/qwen3_voc.sock"):
         self.socket_path = socket_path
         self.is_onnx = model_path.endswith('.onnx')
+        self.stateful = 'stateful' in os.path.basename(model_path)
 
         if self.is_onnx:
             import onnxruntime as ort
@@ -143,6 +149,26 @@ class VocoderServer:
             self.max_tokens = int(m.group(1)) if m else 256
             print(f"Vocoder: RKNN NPU, max_tokens={self.max_tokens}")
 
+        if self.stateful:
+            # streaming state: conv caches + sliding-window KV, carried across
+            # requests of one utterance; reset (n_tokens=0) flushes the
+            # leftover < max_tokens tokens and starts a new utterance
+            self.cache = np.zeros(STATEFUL_CACHE_NUMEL, dtype=np.float32)
+            self.pos = 0   # absolute token index of the next step
+            # tokens not yet voiced (the model steps in fixed max_tokens
+            # groups; a request boundary in the middle of a group must NOT
+            # zero-pad — padding poisons the caches — it must buffer)
+            self.buf = np.zeros((0, 16), dtype=np.int64)
+            # RoPE angles are host-side model inputs (cos/sin computed
+            # in-graph: cos/sin inputs explode on the NPU; the attention mask
+            # is in-graph too); inv_freq from rope_theta
+            self.inv_freq = np.exp2(
+                -np.log2(10000.0)
+                * np.arange(STATEFUL_HEAD_DIM // 2, dtype=np.float32)
+                / (STATEFUL_HEAD_DIM // 2))
+            self.kv_len = STATEFUL_KV_LEN
+            print("Vocoder: stateful streaming mode (no chunk seams)")
+
         self._running = True
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -156,8 +182,53 @@ class VocoderServer:
         else:
             return self.rknn.inference(inputs=[padded])[0].flatten()
 
+    def _inference_stateful(self, padded, pos):
+        L = padded.shape[2]
+        p = pos + np.arange(L, dtype=np.float32)
+        # RoPE angles reduced mod 2*pi (fp32 trig on host; the graph computes
+        # cos/sin — feeding cos/sin as RKNN inputs explodes the NPU fp16
+        # pipeline, and raw angles > ~1e3 lose fp16 precision: ulp(1000)=0.5).
+        # The sliding-window mask is in-graph (constant window +
+        # cache-validity bias), no mask input.
+        freqs = np.remainder(np.outer(p, self.inv_freq),
+                             2 * np.pi).astype(np.float32)
+        # 0.0 on the first step of an utterance (cache slots never written),
+        # 1.0 after — masks the empty history slots inside the graph
+        cv = (np.zeros if pos == 0 else np.ones)(1, np.float32)
+        if self.is_onnx:
+            w, c = self.sess.run(None, {
+                'audio_codes': padded, 'freqs_in': freqs,
+                'cache_valid': cv, 'cache_in': self.cache})
+        else:
+            # w16a16 build stores fp32 inputs as fp16
+            w, c = self.rknn.inference(
+                inputs=[padded, freqs.astype(np.float16),
+                        cv.astype(np.float16),
+                        self.cache.astype(np.float16)])
+        self.cache = c
+        return w.flatten()
+
     def synthesize(self, codes_array):
         n_tokens = len(codes_array)
+
+        # Stateful streaming: the whole decoder is one continuous causal run —
+        # conv caches and sliding-window KV live in the cache tensor across
+        # requests. Requests are buffered so every model step carries exactly
+        # max_tokens REAL tokens (zero-padding mid-utterance would write
+        # silence into the caches); the leftover tail is voiced by the reset
+        # request. No chunk boundaries at all.
+        if self.stateful:
+            self.buf = np.concatenate([self.buf, codes_array])
+            out = []
+            while len(self.buf) >= self.max_tokens:
+                seg = self.buf[:self.max_tokens]
+                self.buf = self.buf[self.max_tokens:]
+                padded = np.zeros((1, 16, self.max_tokens), dtype=np.int64)
+                padded[0] = seg[:, :16].T
+                out.append(self._inference_stateful(padded, self.pos))
+                self.pos += self.max_tokens
+            return (np.concatenate(out) if out
+                    else np.array([], dtype=np.float32))
 
         # Single chunk — no overlap needed
         if n_tokens <= self.max_tokens:
@@ -241,6 +312,30 @@ class VocoderServer:
                     continue
                 n_tokens = struct.unpack("<i", header)[0]
 
+                if n_tokens == 0 and self.stateful:
+                    # utterance boundary: voice the buffered tail, then drop
+                    # streaming state
+                    tail = []
+                    if len(self.buf):
+                        seg = self.buf
+                        self.buf = np.zeros((0, 16), dtype=np.int64)
+                        padded = np.zeros((1, 16, self.max_tokens),
+                                          dtype=np.int64)
+                        padded[0, :, :len(seg)] = seg[:, :16].T
+                        tail.append(self._inference_stateful(
+                            padded, self.pos)[:len(seg) * SAMPLES_PER_TOKEN])
+                    audio = (np.concatenate(tail) if tail
+                             else np.array([], dtype=np.float32))
+                    self.cache = np.zeros(STATEFUL_CACHE_NUMEL,
+                                          dtype=np.float32)
+                    self.pos = 0
+                    audio_int16 = np.clip(audio * 32767, -32768,
+                                          32767).astype(np.int16)
+                    conn.sendall(struct.pack("<i", len(audio_int16)))
+                    conn.sendall(audio_int16.tobytes())
+                    conn.close()
+                    continue
+
                 if n_tokens <= 0 or n_tokens > 10000:
                     conn.close()
                     continue
@@ -274,6 +369,14 @@ class VocoderServer:
 
             except Exception as e:
                 print(f"  Vocoder Error: {e}")
+                if self.stateful:
+                    # a half-processed request must not leak buffered tokens or
+                    # caches into the next utterance: its start flush would
+                    # voice the stale tokens (and the client discards that
+                    # audio), and the new utterance would inherit their history
+                    self.buf = np.zeros((0, 16), dtype=np.int64)
+                    self.cache = np.zeros(STATEFUL_CACHE_NUMEL, dtype=np.float32)
+                    self.pos = 0
             finally:
                 conn.close()
 

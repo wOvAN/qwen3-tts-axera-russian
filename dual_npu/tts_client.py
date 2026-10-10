@@ -54,6 +54,8 @@ def find_pause(x, min_len=3600, win=480):
 VOC_CHUNK_SIZE = 64  # new tokens per streaming vocoder chunk
 VOC_CTX = 48         # tokens of real context prepended per chunk (model = 112)
 VOC_SLOTS = 112      # fixed vocoder model input size
+# stateful model (env VOCODER_MODEL): continuous streaming, no seams/ctx/stitch
+VOC_STATEFUL = 'stateful' in os.environ.get('VOCODER_MODEL', '')
 
 
 def stitch(a, b, Wmax=SAMPLE_RATE, K=480, Fd=960, Fm=480, G=2400,
@@ -165,6 +167,33 @@ class Qwen3TTSClient:
             w[f"codec_emb_{i}"].astype(np.float32) for i in range(15)
         ]
 
+    def _vocoder_reset(self):
+        """Stateful vocoder: n_tokens=0 request flushes the server's buffered
+        tail (tokens not filling a full model step) and drops the streaming
+        state. Returns the flushed audio (empty at an utterance start)."""
+        try:
+            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            c.connect(self.voc_socket)
+            c.sendall(struct.pack("<i", 0))
+            header = b""
+            while len(header) < 4:
+                d = c.recv(4 - len(header))
+                if not d:
+                    break
+                header += d
+            n_samples = struct.unpack("<i", header)[0]
+            data = b""
+            while len(data) < n_samples * 2:
+                d = c.recv(min(65536, n_samples * 2 - len(data)))
+                if not d:
+                    break
+                data += d
+            c.close()
+            return np.frombuffer(data, dtype=np.int16)
+        except Exception as e:
+            print(f"  Vocoder reset error: {e}")
+            return np.array([], dtype=np.int16)
+
     def _vocoder_chunk(self, codes_list, chunk_idx, results, ctx=None):
         """Process one vocoder chunk in background thread (RKNN NPU).
 
@@ -173,6 +202,10 @@ class Qwen3TTSClient:
         + VOC_CTX); its audio is trimmed off the response.
         """
         try:
+            if VOC_STATEFUL:
+                ctx = None
+                if chunk_idx == 0:
+                    self._vocoder_reset()
             codes_array = np.array(codes_list, dtype=np.int64)
             n_ctx = 0
             if ctx:
@@ -296,7 +329,7 @@ class Qwen3TTSClient:
             # audio (adaptive seam), so stitch() joins chunks inside a
             # pause instead of mid-phrase.
             if streaming and len(all_codes) - next_start >= VOC_CHUNK_SIZE:
-                if voc_threads:
+                if voc_threads and not VOC_STATEFUL:
                     voc_threads[-1].join()
                     a = voc_results.get(voc_chunk_idx - 1)
                     if a is not None and len(a) > int(3.0 * SAMPLE_RATE) + 2400:
@@ -356,7 +389,7 @@ class Qwen3TTSClient:
             # Streaming: seam-shift the remainder too, then submit the tail
             voc_threads[-1].join()
             a = voc_results.get(voc_chunk_idx - 1)
-            if (a is not None and next_start < n_tokens
+            if (not VOC_STATEFUL and a is not None and next_start < n_tokens
                     and len(a) > int(3.0 * SAMPLE_RATE) + 2400):
                 Ws = int(3.0 * SAMPLE_RATE)
                 k = find_pause(a[-Ws:])
@@ -383,6 +416,9 @@ class Qwen3TTSClient:
             # Non-streaming or single chunk: process directly
             t_voc = time.time()
             self._vocoder_chunk(pending_codes, 0, voc_results)
+            # consumed slot 0: the stateful tail flush below must land in the
+            # next slot, not overwrite this audio
+            voc_chunk_idx = 1
             print(f"Vocoder: {time.time() - t_voc:.1f}s ({len(pending_codes)} tokens)")
 
         # Wait for all vocoder threads
@@ -392,6 +428,15 @@ class Qwen3TTSClient:
                 t.join()
             print(f"Vocoder wait: {time.time() - t_wait:.1f}s ({len(voc_threads)} chunks)")
 
+        # Stateful: the server buffers tokens to full model steps; the reset
+        # flushes and returns the tail (a request boundary mid-step must not
+        # be zero-padded — padding writes silence into the caches).
+        if VOC_STATEFUL:
+            tail = self._vocoder_reset()
+            if len(tail):
+                voc_results[voc_chunk_idx] = tail
+                voc_chunk_idx += 1
+
         dump = os.environ.get("TTS_DUMP_CODES")
         if dump:
             np.save(dump, np.array(all_codes, dtype=np.int64))
@@ -399,7 +444,7 @@ class Qwen3TTSClient:
         # Concatenate audio in order, stitching chunk joins with the same
         # pause/micro-blend rule as the vocoder server
         audio_chunks = []
-        for i in range(max(len(voc_threads), 1)):
+        for i in range(voc_chunk_idx):
             if i in voc_results and len(voc_results[i]) > 0:
                 audio_chunks.append(voc_results[i].astype(np.float32))
 
@@ -409,7 +454,11 @@ class Qwen3TTSClient:
 
         audio_f32 = audio_chunks[0]
         for b in audio_chunks[1:]:
-            audio_f32 = stitch(audio_f32, b, overlap=2 * SAMPLES_PER_TOKEN)
+            if VOC_STATEFUL:
+                audio_f32 = np.concatenate([audio_f32, b])
+            else:
+                audio_f32 = stitch(audio_f32, b,
+                                   overlap=2 * SAMPLES_PER_TOKEN)
         audio_int16 = np.clip(audio_f32, -32768, 32767).astype(np.int16)
 
         # Save WAV
