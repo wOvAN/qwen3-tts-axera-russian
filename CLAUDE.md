@@ -313,3 +313,20 @@ What does not work as shipped:
 - Streaming TTFB on the stateful path, measured: client start → first 64-token chunk submitted
   +5.7 s, stateful vocoder step 3.6 s → **first audio ≈ 9.3 s** (was 19-23 s on the FP32-CPU
   vocoder, 6.6 s to chunk submission after the cast fix).
+- **Long utterances: `n_ctx` 512 → `N_CTX` 2048, `n_batch` decoupled, per-request token budget.**
+  `n_ctx=512` + `MAX_TOKENS=200` truncated a long text mid-phrase (no forced EOS — the talker just
+  sends `SENTINEL_DONE`), while the model's adaptive EOS wants ~3× the text-token count (forced at
+  6×). Measured on the board, 189-text-token Russian request: 430 tokens to a natural EOS at
+  6.6 tok/s, 26.08 s audio, 73 s wall (RTF 2.8x on a 26-s utterance; the 200-token scale ran
+  7.5 tok/s, so length costs ~12% generation rate through KV reads, it is not a wall). Keep
+  `N_BATCH` (512) separate from `N_CTX`: the wrapper feeds it to `params.n_batch/n_ubatch`, which
+  sizes the ggml compute buffer — `sched_reserve` reports 1243 MiB at n_batch=2048 vs 311 MiB at
+  512, resident on the four A76 cores the CP shares.
+- **`CP_GGML_MODEL`'s old default pointed at a filename nothing produces**
+  (`qwen3-tts-0.6b-q4_0.gguf`; the quantizer writes `qwen3-tts-0.6b-cp-q8_0.gguf`), and the CP
+  backend probe is a bare `[ -f ]`, so the whole pipeline silently ran the Python ONNX CP:
+  **390 ms vs 63 ms per 15-step request (6.1x)**, 6.6 → 2.2 tok/s end to end, with no log line
+  beyond the startup banner. If generation is ~2 tok/s, check the banner's "Code Predictor:" line
+  first. `cleanup()` in `launch_qwen3_tts.sh` also now escalates SIGTERM → SIGKILL after 3 s:
+  the GGML CP blocks in `accept()` and its handler only flips a flag, so idle instances survived
+  teardown and piled up.
