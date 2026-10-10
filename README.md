@@ -161,6 +161,25 @@ gets faster. The fp32 self-check of the export (stepwise vs full decode, `--chec
 | + 2-thread ONNX CP | ONNX 2-thread (265ms) | RKNN Q8 | 4.4x |
 | + GGML Q4_0 CP | **GGML (55ms)** | RKNN Q8 | 2.2x |
 | + ONNX FP32 vocoder | GGML (55ms) | **ONNX FP32** | **2.0x** |
+| + ffn_down cast fix | GGML Q8_0 (64ms/15 steps) | ONNX FP32 | 2.6x (3.0x streaming) |
+| + RKNN FP16 vocoder on NPU | GGML Q8_0 (64ms/15 steps) | **RKNN FP16 (112-tok chunks)** | 1.8x |
+| + stateful streaming vocoder | GGML Q8_0 (64ms/15 steps) | **RKNN FP16 stateful (no chunks)** | **1.9x** |
+
+The last three rows are measured on this board (Russian text, 4×A76; the cast-fix row is
+non-streaming, the other two `--streaming`); the CP times in the rows above are the
+upstream-reported ones. The 1.8x and 1.9x rows are different texts (137 / 200 tokens) — the
+stateful path's own A/B against the chunked-seam vocoder on one fixed 200-token text is
+2.6x → 1.9x.
+
+Streaming TTFB on the stateful path is **≈9.3 s**: the first 64-token chunk is submitted at +5.7 s
+and the stateful vocoder step takes 3.6 s (19–23 s with the FP32-CPU vocoder). The code predictor —
+63% of per-token CPU time — is the one component the NPU does *not* help: the stateful step graph
+(`scripts/export_code_predictor_stateful.py` + `scripts/convert_code_predictor_rknn.py`, verified
+15/15 codebooks and 2.8e-05 step-0 logit diff against an fp64 reference) runs at **23.2 ms/step on
+the three NPU cores against 4.3 ms/step on 4×A76** with GGML Q8_0 — 5.4x slower. 157 MB of fp16
+weights in 23 ms is 6.8 GB/s, ~6x under the board's ~40 GB/s, so the cost is per-op overhead: ~75
+tiny S=1 GEMV ops plus 1.3 MB of KV cache across the runtime boundary on every call. The NPU pays
+off on real GEMMs (the vocoder's 64-token chunk), not on 16 sequential one-token steps.
 
 ## Quick Start
 

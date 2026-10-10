@@ -283,5 +283,26 @@ What does not work as shipped:
   full decode) is 48.8 dB — the kv-selection matmuls' fp32 accumulation noise; the export's check
   threshold is therefore 40 dB, do not raise it back to 80 (it aborts *before*
   `torch.onnx.export`, which then leaves a stale ONNX for the converter to load).
-
-
+- **Code predictor on the NPU — built, measured, rejected (do not rebuild the backend).**
+  `scripts/export_code_predictor_stateful.py` (one stateful decode step, KV cache in graph I/O:
+  14 inputs / 11 outputs, ONE graph for all 16 positions because the per-token sequence is exactly
+  16 long, so the cache length is a compile-time constant; the step index enters as data —
+  `freqs_in` RoPE angles mod 2π, `sel` one-hot cache write index, `mask` additive −100) plus
+  `scripts/convert_code_predictor_rknn.py` (FP16, 152.6 MB) do work: the export scores 15/15
+  codebooks on every input and 2.8e-05 max step-0 logit diff against an independent numpy-fp64
+  re-run of the same transformer. The board probe (`/root/tts-rknn/cp/cp_npu_probe.py`) says
+  **23.2 ms/step on NPU cores 0_1_2 vs 4.3 ms/step for the CPU GGML Q8_0 CP — 5.4x slower**, so the
+  CP stays on the CPU. Not bandwidth: 157 MB fp16 / 23 ms = 6.8 GB/s, ~6x under the board's
+  ~40 GB/s ceiling; the step is ~75 tiny S=1 GEMV ops plus 1.3 MB of KV across the runtime boundary
+  per call, and the NPU matrix units only pay off on real GEMMs (the vocoder's 64-token chunk).
+  Compiler flags are not the lever either: `qwen3-tts.cpp` builds Release with `-march=native`
+  (gcc 15.2 aarch64) and the binary already contains `udot/umlal/fcvtl`.
+  Export traps, all measured: `torch.onnx.export(..., dynamo=False)` is required (the
+  torch.export decomposition set emits Reshape/Unsqueeze/Slice patterns that kill
+  rknn-toolkit2's `graph_optimizer.fuse_ops` with `KeyError: 'unsqueeze_8_rs'`), the graph must be
+  matmul-only (no Concat/Expand/Unsqueeze), and the GQA selection matmul emits `[B,L,H,D]` — with
+  `L_KV == N_HEADS == 16` a missing `.transpose(1,2)` is shape-invisible and numerically fatal
+  (1-pos hidden diff 15.6, 0/15 codebooks).
+- Streaming TTFB on the stateful path, measured: client start → first 64-token chunk submitted
+  +5.7 s, stateful vocoder step 3.6 s → **first audio ≈ 9.3 s** (was 19-23 s on the FP32-CPU
+  vocoder, 6.6 s to chunk submission after the cast fix).

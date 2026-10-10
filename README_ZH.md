@@ -149,6 +149,22 @@ code predictor 手里抢 A76 核，所以生成本身也变快了。导出的 fp
 | 基线 (RKLLM talker) | ONNX 单线程 (374ms) | RKNN Q8 | 5.5x |
 | + GGML Q4_0 CP | **GGML (55ms)** | RKNN Q8 | 2.2x |
 | + ONNX FP32 声码器 | GGML (55ms) | **ONNX FP32** | **2.0x** |
+| + 修复 ffn_down cast | GGML Q8_0 (64ms/15步) | ONNX FP32 | 2.6x（流式 3.0x） |
+| + RKNN FP16 声码器上 NPU | GGML Q8_0 (64ms/15步) | **RKNN FP16（112 token 分块）** | 1.8x |
+| + 有状态流式声码器 | GGML Q8_0 (64ms/15步) | **RKNN FP16 有状态（无分块）** | **1.9x** |
+
+最后三行是在本板卡实测（俄语文本，4×A76；修复 cast 那行是非流式，其余两行 `--streaming`）；
+上面各行的 CP 耗时是上游报告的数值。1.8x 与 1.9x 两行文本长度不同（137 / 200 token）——
+有状态路径与分块接缝声码器在同一 200 token 文本上的 A/B 是 2.6x → 1.9x。
+
+有状态路径的流式 TTFB 为 **≈9.3 秒**：首个 64-token 分块在 +5.7 秒提交，有状态声码器一步 3.6 秒
+（FP32-CPU 声码器时代是 19–23 秒）。code predictor 占每个 token 的 63% CPU 时间，也是唯一
+NPU *帮不上忙*的组件：有状态单步图（`scripts/export_code_predictor_stateful.py` +
+`scripts/convert_code_predictor_rknn.py`，自检 15/15 码本、首步 logit 相对 fp64 参考差 2.8e-05）
+在三个 NPU 核上是 **23.2 ms/步，而 4×A76 + GGML Q8_0 是 4.3 ms/步——慢 5.4 倍**。157 MB fp16
+权重 23 ms 读完只有 6.8 GB/s，比板卡 ~40 GB/s 上限低约 6 倍，所以代价在单算子开销：每次调用约 75
+个 S=1 的微型 GEMV，外加 1.3 MB KV 缓存跨越运行时边界。NPU 在真正的 GEMM 上才划算（声码器
+64-token 分块），而不是 16 个一次一个 token 的串行步。
 
 ## 快速开始
 
