@@ -292,14 +292,14 @@ What does not work as shipped:
   codebooks on every input and 2.8e-05 max step-0 logit diff against an independent numpy-fp64
   re-run of the same transformer. The board probe (`/root/tts-rknn/cp/cp_npu_probe.py`) says
   **23.2 ms/step on NPU cores 0_1_2 vs 4.3 ms/step for the CPU GGML Q8_0 CP — 5.4x slower**, so the
-  CP stays on the CPU. Not bandwidth: 157 MB fp16 / 23 ms = 6.8 GB/s, ~6x under the board's
-  ~40 GB/s ceiling; the step is ~75 tiny S=1 GEMV ops plus 1.3 MB of KV across the runtime boundary
+  CP stays on the CPU. Not bandwidth: 157 MB fp16 / 23 ms = 6.8 GB/s, 4x under the board's measured
+  27.3 GB/s ceiling; the step is ~75 tiny S=1 GEMV ops plus 1.3 MB of KV across the runtime boundary
   per call, and the NPU matrix units only pay off on real GEMMs (the vocoder's 64-token chunk).
   Compiler flags are not the lever either: `qwen3-tts.cpp` builds Release with `-march=native`
   (gcc 15.2 aarch64) and the binary already contains `udot/umlal/fcvtl`.
   The `.rkllm` variant (whole 5-layer predictor as an RKLLM model, 15 steps on the NPU) is closed by
-  the same inequality, no build needed: the CPU path reads 157 MB of Q8_0 in 4.3 ms = 36.5 GB/s, i.e.
-  it sits on the board's ~40 GB/s DRAM ceiling, and the NPU shares that controller. RKLLM's measured
+  the same inequality, no build needed: the CPU path reads the ~72 MB of Q8_0 weights it touches per
+  step in 4.24 ms = 17 GB/s, 62% of the measured ceiling, and RKLLM's measured
   effective weight-read rate on this board is ~15 GB/s (0.5B W8A8 at 16 tok/s, per
   `cosyvoice3-rknn-russian/docs/BENCHMARKS.md`), so a 78 MB W8A8 CP would be ~5.2 ms/step — slower
   before quality is even considered, and W8A8 on a token-generating transformer is that repo's
@@ -316,12 +316,30 @@ What does not work as shipped:
 - **Long utterances: `n_ctx` 512 → `N_CTX` 2048, `n_batch` decoupled, per-request token budget.**
   `n_ctx=512` + `MAX_TOKENS=200` truncated a long text mid-phrase (no forced EOS — the talker just
   sends `SENTINEL_DONE`), while the model's adaptive EOS wants ~3× the text-token count (forced at
-  6×). Measured on the board, 189-text-token Russian request: 430 tokens to a natural EOS at
-  6.6 tok/s, 26.08 s audio, 73 s wall (RTF 2.8x on a 26-s utterance; the 200-token scale ran
-  7.5 tok/s, so length costs ~12% generation rate through KV reads, it is not a wall). Keep
-  `N_BATCH` (512) separate from `N_CTX`: the wrapper feeds it to `params.n_batch/n_ubatch`, which
-  sizes the ggml compute buffer — `sched_reserve` reports 1243 MiB at n_batch=2048 vs 311 MiB at
-  512, resident on the four A76 cores the CP shares.
+  6×). Keep `N_BATCH` (512) separate from `N_CTX`: the wrapper feeds it to `params.n_batch/n_ubatch`,
+  which sizes the ggml compute buffer — `sched_reserve` reports 1243 MiB at n_batch=2048 vs 311 MiB
+  at 512, resident on the four A76 cores the CP shares. Measured on the board with the protocol
+  probe below in place, one 948-char Russian request (784-790 tokens, 62-63 s audio): non-streaming
+  9.6 tok/s / 123 s wall / RTF 2.0x, `--streaming` 6.9 tok/s / vocoder wait 0.0 s / 117 s /
+  **RTF 1.9x**. Streaming buys TTFB, not throughput.
+- **Per-token budget, measured with `-DQWEN3_TTS_TIMING=ON` on the board:** talker 24.9 ms
+  (llama.cpp decode + Python sampling, grows 29 → 37.5 ms as the KV cache fills), CP **63.2 ms**
+  (flat with length), client 0.25 ms → 88 ms/token = 11.3 tok/s with the vocoder idle. Streaming
+  costs 28% of that (6.9 tok/s) because the stateful vocoder's CPU-side marshalling shares the
+  A76s; `VOC_CORES=0-3` (A55) is a measured loss, 5.3 tok/s / RTF 3.9x. Board DRAM read ceiling
+  measured with a NEON stream probe: **27.3 GB/s on 4×A76, 17.2 GB/s on 4×A55**, 16.8 on one A76.
+  The CP reads ~72 MB of Q8_0 weights per step in 4.24 ms = 17 GB/s = 62% of that ceiling, and its
+  own phase split is `build 1.3 + alloc 1.7 + compute 63.6 + data 1.0` ms — 94% compute, so graph
+  reuse across the 15 steps is worth ≤6% and quantization below Q8_0 is the only byte-level lever
+  (Q6_K ≈ 0.80x bytes; Q4_0 measured 1.29x speed at unusable codebook agreement).
+- **The client probes the vocoder protocol; it must not guess it.** `tts_client.py` sends a
+  0-token request at the start of each utterance: a stateful server answers it (and flushes), a
+  chunked-seam server closes the connection. `VOC_STATEFUL = 'stateful' in
+  os.environ['VOCODER_MODEL']` — the old inference — silently ran a stateful server through the
+  chunked path whenever the client was launched without that env var (daemon mode + a bare client
+  shell), prepending 48 context tokens and seam-stitching audio the server never chunked:
+  **795 tokens → 47.04 s of audio instead of 63.6 s (26% of the utterance gone)**, RTF 2.9x vs 1.9x,
+  no error. Any client-side behaviour that depends on which vocoder is running belongs on the probe.
 - **`CP_GGML_MODEL`'s old default pointed at a filename nothing produces**
   (`qwen3-tts-0.6b-q4_0.gguf`; the quantizer writes `qwen3-tts-0.6b-cp-q8_0.gguf`), and the CP
   backend probe is a bare `[ -f ]`, so the whole pipeline silently ran the Python ONNX CP:

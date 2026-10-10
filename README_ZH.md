@@ -162,17 +162,27 @@ code predictor 手里抢 A76 核，所以生成本身也变快了。导出的 fp
 NPU *帮不上忙*的组件：有状态单步图（`scripts/export_code_predictor_stateful.py` +
 `scripts/convert_code_predictor_rknn.py`，自检 15/15 码本、首步 logit 相对 fp64 参考差 2.8e-05）
 在三个 NPU 核上是 **23.2 ms/步，而 4×A76 + GGML Q8_0 是 4.3 ms/步——慢 5.4 倍**。157 MB fp16
-权重 23 ms 读完只有 6.8 GB/s，比板卡 ~40 GB/s 上限低约 6 倍，所以代价在单算子开销：每次调用约 75
-个 S=1 的微型 GEMV，外加 1.3 MB KV 缓存跨越运行时边界。NPU 在真正的 GEMM 上才划算（声码器
-64-token 分块），而不是 16 个一次一个 token 的串行步。`.rkllm` 路线被同一个不等式关闭：CPU 路径
-已经用 4.3 ms 读完 157 MB = 36.5 GB/s，即坐在板卡 ~40 GB/s 的 DRAM 上限上，而 RKLLM 在本板实测的
-有效权重读取速度约 15 GB/s。
+权重 23 ms 读完只有 6.8 GB/s，比板卡实测上限低 4 倍（4×A76 流式读 4 KB 块 27.3 GB/s，
+4×A55 是 17.2 GB/s），所以代价在单算子开销：每次调用约 75 个 S=1 的微型 GEMV，外加
+1.3 MB KV 缓存跨越运行时边界。NPU 在真正的 GEMM 上才划算（声码器 64-token 分块），而不是
+16 个一次一个 token 的串行步。`.rkllm` 路线被同一个不等式关闭：CPU 路径每步真正读取的
+~72 MB Q8_0 权重用 4.24 ms 读完 = 17 GB/s，即实测上限的 62%，而 RKLLM 在本板实测的有效
+权重读取速度约 15 GB/s。
 
 长句不再被截断。talker 上下文是 `N_CTX`（默认 2048；`N_BATCH` 独立且保持小值——ggml compute
 buffer 由 n_batch 决定大小：2048 时 1243 MiB，512 时 311 MiB，而它占的正是 code predictor 用的
 那几个核），每请求预算是 `min(MAX_TOKENS, N_CTX − prefix − 1)`，所以长文本由模型自己的 EOS 收尾。
-实测：189 个文本 token 的请求生成 430 个 token（26.1 秒音频），6.6 tok/s，wall 73 秒
-（26 秒句子上 RTF 2.8x，16 秒量级是 1.9x）。
+板端实测，同一个 948 字符请求（784–790 token，62–63 秒音频）：非流式 9.6 tok/s，wall 123 秒，
+**RTF 2.0x**；`--streaming` 6.9 tok/s，声码器等待 0.0 秒，wall 117 秒，**RTF 1.9x**。流式买到的是
+TTFB 而不是吞吐：有状态声码器的 CPU 侧工作（每个 64-token 分块有 10.6 MB 缓存与音频进出
+RKNN 运行时）与 code predictor 共享四个 A76 核，代价约其速率的 28%。把声码器搬到 A55 集群
+（`VOC_CORES=0-3`）实测是亏损：5.3 tok/s，RTF 3.9x——A55 扛不住这份 marshalling
+（17.2 对 27.3 GB/s）。
+
+客户端不再按自己的环境变量猜声码器协议，而是在每句话开头用一个 0-token 请求去问
+（有状态服务器会应答，分块接缝服务器直接关连接）。旧的推断方式会让有状态服务器静默走
+分块路径：前置 48 个上下文 token，然后对服务器根本没分块的音频做裁剪与接缝拼接——
+整句静默丢掉 26%（795 token 只出 47.04 秒音频，应为 63.6 秒），且没有任何报错。
 
 ## 快速开始
 

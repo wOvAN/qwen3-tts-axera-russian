@@ -177,19 +177,32 @@ and the stateful vocoder step takes 3.6 s (19–23 s with the FP32-CPU vocoder).
 (`scripts/export_code_predictor_stateful.py` + `scripts/convert_code_predictor_rknn.py`, verified
 15/15 codebooks and 2.8e-05 step-0 logit diff against an fp64 reference) runs at **23.2 ms/step on
 the three NPU cores against 4.3 ms/step on 4×A76** with GGML Q8_0 — 5.4x slower. 157 MB of fp16
-weights in 23 ms is 6.8 GB/s, ~6x under the board's ~40 GB/s, so the cost is per-op overhead: ~75
+weights in 23 ms is 6.8 GB/s, 4x under the board's measured DRAM read ceiling (27.3 GB/s streaming
+4 KB blocks over 4×A76, 17.2 GB/s over 4×A55), so the cost is per-op overhead: ~75
 tiny S=1 GEMV ops plus 1.3 MB of KV cache across the runtime boundary on every call. The NPU pays
 off on real GEMMs (the vocoder's 64-token chunk), not on 16 sequential one-token steps. The `.rkllm`
-route is closed by the same arithmetic: the CPU path already reads 157 MB in 4.3 ms = 36.5 GB/s, i.e.
-it sits on the board's ~40 GB/s DRAM ceiling, and RKLLM's measured effective weight-read rate on this
-board is ~15 GB/s.
+route is closed by the same arithmetic: the CPU path reads the ~72 MB of Q8_0 weights it actually
+touches per step in 4.24 ms = 17 GB/s, i.e. 62% of the measured ceiling, while RKLLM's measured
+effective weight-read rate on this board is ~15 GB/s.
 
 Long utterances are no longer truncated. The talker context is `N_CTX` (default 2048; `N_BATCH`
 stays separate and small — the ggml compute buffer is sized by n_batch: 1243 MiB at 2048 vs
 311 MiB at 512, on the cores the code predictor shares) and the per-request budget is
-`min(MAX_TOKENS, N_CTX − prefix − 1)`, so a long text stops at the model's own EOS. Measured: a
-189-text-token Russian request generates 430 tokens (26.1 s of audio) at 6.6 tok/s, 73 s wall
-(RTF 2.8x on a 26-s utterance, vs 1.9x at the 16-s scale).
+`min(MAX_TOKENS, N_CTX − prefix − 1)`, so a long text stops at the model's own EOS. Measured on the
+board, one 948-char Russian request (784-790 tokens, 62-63 s of audio): non-streaming 9.6 tok/s,
+123 s wall, **RTF 2.0x**; `--streaming` 6.9 tok/s, vocoder wait 0.0 s, 117 s wall, **RTF 1.9x**.
+Streaming buys TTFB, not throughput: the stateful vocoder's CPU-side work (10.6 MB of cache and
+audio marshalled in and out of the RKNN runtime per 64-token step) shares the four A76 cores with
+the code predictor and costs it ~28% of its rate. Pinning the vocoder to the A55 cluster
+(`VOC_CORES=0-3`) is a measured loss — 5.3 tok/s, RTF 3.9x — that cluster is too slow for the
+marshalling (17.2 vs 27.3 GB/s).
+
+The client does not guess which vocoder protocol the server speaks: it probes it with a 0-token
+request at the start of every utterance (a stateful server answers it, a chunked-seam server closes
+the connection). Inferring it from the client's own `VOCODER_MODEL` environment silently mis-ran the
+stateful server through the chunked path — 48 context tokens prepended, then trimmed and
+seam-stitched against audio the server never chunked — which dropped 26% of the utterance (795
+tokens → 47.04 s of audio instead of 63.6 s) with no error.
 
 ## Quick Start
 

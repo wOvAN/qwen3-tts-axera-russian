@@ -54,8 +54,11 @@ def find_pause(x, min_len=3600, win=480):
 VOC_CHUNK_SIZE = 64  # new tokens per streaming vocoder chunk
 VOC_CTX = 48         # tokens of real context prepended per chunk (model = 112)
 VOC_SLOTS = 112      # fixed vocoder model input size
-# stateful model (env VOCODER_MODEL): continuous streaming, no seams/ctx/stitch
-VOC_STATEFUL = 'stateful' in os.environ.get('VOCODER_MODEL', '')
+# The vocoder protocol (stateful streaming vs chunked seams) is probed against the
+# running server in synthesize(), NOT read from this process's environment: a client
+# that guesses 'chunked' against a stateful server prepends 48 context tokens, then
+# trims and seam-stitches audio the server never chunked — measured 26% of the
+# utterance silently dropped (795 tokens -> 47.04 s of audio instead of 63.6 s).
 
 
 def stitch(a, b, Wmax=SAMPLE_RATE, K=480, Fd=960, Fm=480, G=2400,
@@ -133,6 +136,8 @@ class Qwen3TTSClient:
         self.talker_socket = talker_socket
         self.cp_socket = cp_socket
         self.voc_socket = voc_socket
+        # vocoder protocol, probed once per utterance in synthesize()
+        self.stateful = None
 
         # Load codec_embedding for feedback computation
         if embeddings_dir:
@@ -170,7 +175,11 @@ class Qwen3TTSClient:
     def _vocoder_reset(self):
         """Stateful vocoder: n_tokens=0 request flushes the server's buffered
         tail (tokens not filling a full model step) and drops the streaming
-        state. Returns the flushed audio (empty at an utterance start)."""
+        state. Returns (answered, audio): a chunked-seam server closes the
+        connection on a 0-token request instead of answering it, so `answered`
+        doubles as the stateful-mode probe. At an utterance start the buffer is
+        empty, so the probe is also the start flush."""
+        empty = np.array([], dtype=np.int16)
         try:
             c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             c.connect(self.voc_socket)
@@ -179,7 +188,8 @@ class Qwen3TTSClient:
             while len(header) < 4:
                 d = c.recv(4 - len(header))
                 if not d:
-                    break
+                    c.close()
+                    return False, empty
                 header += d
             n_samples = struct.unpack("<i", header)[0]
             data = b""
@@ -189,10 +199,10 @@ class Qwen3TTSClient:
                     break
                 data += d
             c.close()
-            return np.frombuffer(data, dtype=np.int16)
+            return True, np.frombuffer(data, dtype=np.int16)
         except Exception as e:
             print(f"  Vocoder reset error: {e}")
-            return np.array([], dtype=np.int16)
+            return False, empty
 
     def _vocoder_chunk(self, codes_list, chunk_idx, results, ctx=None):
         """Process one vocoder chunk in background thread (RKNN NPU).
@@ -202,7 +212,7 @@ class Qwen3TTSClient:
         + VOC_CTX); its audio is trimmed off the response.
         """
         try:
-            if VOC_STATEFUL:
+            if self.stateful:
                 ctx = None
                 if chunk_idx == 0:
                     self._vocoder_reset()
@@ -255,6 +265,12 @@ class Qwen3TTSClient:
         print(f"Language: {language}")
 
         t_start = time.time()
+
+        # Ask the vocoder server which protocol it speaks (stateful streaming or
+        # chunked seams) before generating anything. On a stateful server this
+        # request is also the utterance-start flush.
+        self.stateful = self._vocoder_reset()[0]
+        print(f"Vocoder protocol: {'stateful streaming' if self.stateful else 'chunked seams'}")
 
         # Connect to talker
         talker_conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -329,7 +345,7 @@ class Qwen3TTSClient:
             # audio (adaptive seam), so stitch() joins chunks inside a
             # pause instead of mid-phrase.
             if streaming and len(all_codes) - next_start >= VOC_CHUNK_SIZE:
-                if voc_threads and not VOC_STATEFUL:
+                if voc_threads and not self.stateful:
                     voc_threads[-1].join()
                     a = voc_results.get(voc_chunk_idx - 1)
                     if a is not None and len(a) > int(3.0 * SAMPLE_RATE) + 2400:
@@ -389,7 +405,7 @@ class Qwen3TTSClient:
             # Streaming: seam-shift the remainder too, then submit the tail
             voc_threads[-1].join()
             a = voc_results.get(voc_chunk_idx - 1)
-            if (not VOC_STATEFUL and a is not None and next_start < n_tokens
+            if (not self.stateful and a is not None and next_start < n_tokens
                     and len(a) > int(3.0 * SAMPLE_RATE) + 2400):
                 Ws = int(3.0 * SAMPLE_RATE)
                 k = find_pause(a[-Ws:])
@@ -431,8 +447,8 @@ class Qwen3TTSClient:
         # Stateful: the server buffers tokens to full model steps; the reset
         # flushes and returns the tail (a request boundary mid-step must not
         # be zero-padded — padding writes silence into the caches).
-        if VOC_STATEFUL:
-            tail = self._vocoder_reset()
+        if self.stateful:
+            ok, tail = self._vocoder_reset()
             if len(tail):
                 voc_results[voc_chunk_idx] = tail
                 voc_chunk_idx += 1
@@ -454,7 +470,7 @@ class Qwen3TTSClient:
 
         audio_f32 = audio_chunks[0]
         for b in audio_chunks[1:]:
-            if VOC_STATEFUL:
+            if self.stateful:
                 audio_f32 = np.concatenate([audio_f32, b])
             else:
                 audio_f32 = stitch(audio_f32, b,
