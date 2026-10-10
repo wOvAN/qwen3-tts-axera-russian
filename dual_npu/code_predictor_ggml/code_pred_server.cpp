@@ -173,6 +173,13 @@ int main(int argc, char** argv) {
     int hidden_size = config.hidden_size;
     int num_output_codes = config.n_codebooks - 1; // codebooks 1..15
 
+#ifdef QWEN3_TTS_TIMING
+    // Per-phase breakdown of the 15-step request (build/alloc/compute/data),
+    // accumulated by the library and averaged here per request.
+    qwen3_tts::tts_timing timing;
+    transformer.set_timing(&timing);
+#endif
+
     // --- Warmup ---
     printf("\nWarmup...\n");
     for (int w = 0; w < 3; w++) {
@@ -185,6 +192,17 @@ int main(int argc, char** argv) {
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         printf("  warmup %d: %.1fms, %zu codes\n", w + 1, ms, output_codes.size());
     }
+
+#ifdef QWEN3_TTS_TIMING
+    // t_code_pred_ms is only accumulated by generate(); the standalone server
+    // calls predict_codes_autoregressive() directly, so sum the sub-phases.
+    printf("  phases per request (ms): init %.1f + prefill %.1f + steps %.1f\n",
+           timing.t_code_pred_init_ms / 3,
+           timing.t_code_pred_prefill_ms / 3, timing.t_code_pred_steps_ms / 3);
+    printf("  phases by kind  (ms): build %.1f + alloc %.1f + compute %.1f + data %.1f\n",
+           timing.t_code_pred_graph_build_ms / 3, timing.t_code_pred_graph_alloc_ms / 3,
+           timing.t_code_pred_compute_ms / 3, timing.t_code_pred_data_ms / 3);
+#endif
 
     // --- Create server socket ---
     int server_fd = create_server_socket(socket_path.c_str());
