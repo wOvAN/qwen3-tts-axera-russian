@@ -179,7 +179,10 @@ and the stateful vocoder step takes 3.6 s (19–23 s with the FP32-CPU vocoder).
 the three NPU cores against 4.3 ms/step on 4×A76** with GGML Q8_0 — 5.4x slower. 157 MB of fp16
 weights in 23 ms is 6.8 GB/s, ~6x under the board's ~40 GB/s, so the cost is per-op overhead: ~75
 tiny S=1 GEMV ops plus 1.3 MB of KV cache across the runtime boundary on every call. The NPU pays
-off on real GEMMs (the vocoder's 64-token chunk), not on 16 sequential one-token steps.
+off on real GEMMs (the vocoder's 64-token chunk), not on 16 sequential one-token steps. The `.rkllm`
+route is closed by the same arithmetic: the CPU path already reads 157 MB in 4.3 ms = 36.5 GB/s, i.e.
+it sits on the board's ~40 GB/s DRAM ceiling, and RKLLM's measured effective weight-read rate on this
+board is ~15 GB/s.
 
 ## Quick Start
 

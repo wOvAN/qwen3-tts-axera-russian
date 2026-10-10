@@ -297,6 +297,13 @@ What does not work as shipped:
   per call, and the NPU matrix units only pay off on real GEMMs (the vocoder's 64-token chunk).
   Compiler flags are not the lever either: `qwen3-tts.cpp` builds Release with `-march=native`
   (gcc 15.2 aarch64) and the binary already contains `udot/umlal/fcvtl`.
+  The `.rkllm` variant (whole 5-layer predictor as an RKLLM model, 15 steps on the NPU) is closed by
+  the same inequality, no build needed: the CPU path reads 157 MB of Q8_0 in 4.3 ms = 36.5 GB/s, i.e.
+  it sits on the board's ~40 GB/s DRAM ceiling, and the NPU shares that controller. RKLLM's measured
+  effective weight-read rate on this board is ~15 GB/s (0.5B W8A8 at 16 tok/s, per
+  `cosyvoice3-rknn-russian/docs/BENCHMARKS.md`), so a 78 MB W8A8 CP would be ~5.2 ms/step — slower
+  before quality is even considered, and W8A8 on a token-generating transformer is that repo's
+  documented dead end (truncation/repeats/language mixing).
   Export traps, all measured: `torch.onnx.export(..., dynamo=False)` is required (the
   torch.export decomposition set emits Reshape/Unsqueeze/Slice patterns that kill
   rknn-toolkit2's `graph_optimizer.fuse_ops` with `KeyError: 'unsqueeze_8_rs'`), the graph must be
