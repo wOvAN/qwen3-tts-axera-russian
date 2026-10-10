@@ -184,6 +184,13 @@ route is closed by the same arithmetic: the CPU path already reads 157 MB in 4.3
 it sits on the board's ~40 GB/s DRAM ceiling, and RKLLM's measured effective weight-read rate on this
 board is ~15 GB/s.
 
+Long utterances are no longer truncated. The talker context is `N_CTX` (default 2048; `N_BATCH`
+stays separate and small — the ggml compute buffer is sized by n_batch: 1243 MiB at 2048 vs
+311 MiB at 512, on the cores the code predictor shares) and the per-request budget is
+`min(MAX_TOKENS, N_CTX − prefix − 1)`, so a long text stops at the model's own EOS. Measured: a
+189-text-token Russian request generates 430 tokens (26.1 s of audio) at 6.6 tok/s, 73 s wall
+(RTF 2.8x on a 26-s utterance, vs 1.9x at the 16-s scale).
+
 ## Quick Start
 
 ```bash

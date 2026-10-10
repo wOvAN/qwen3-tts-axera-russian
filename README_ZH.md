@@ -168,6 +168,12 @@ NPU *帮不上忙*的组件：有状态单步图（`scripts/export_code_predicto
 已经用 4.3 ms 读完 157 MB = 36.5 GB/s，即坐在板卡 ~40 GB/s 的 DRAM 上限上，而 RKLLM 在本板实测的
 有效权重读取速度约 15 GB/s。
 
+长句不再被截断。talker 上下文是 `N_CTX`（默认 2048；`N_BATCH` 独立且保持小值——ggml compute
+buffer 由 n_batch 决定大小：2048 时 1243 MiB，512 时 311 MiB，而它占的正是 code predictor 用的
+那几个核），每请求预算是 `min(MAX_TOKENS, N_CTX − prefix − 1)`，所以长文本由模型自己的 EOS 收尾。
+实测：189 个文本 token 的请求生成 430 个 token（26.1 秒音频），6.6 tok/s，wall 73 秒
+（26 秒句子上 RTF 2.8x，16 秒量级是 1.9x）。
+
 ## 快速开始
 
 ```bash
