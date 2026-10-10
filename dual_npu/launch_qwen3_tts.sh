@@ -49,7 +49,12 @@ CP_THREADS="${CP_THREADS:-3}"
 # GGML Code Predictor (4.8x faster than ONNX). CP_GGML_THREADS caps the ggml intra-op
 # threads: ggml's default is nproc, which oversubscribes a taskset-pinned core set.
 CP_GGML_BINARY="${CP_GGML_BINARY:-/root/qwen3-tts.cpp/build/code_pred_server}"
-CP_GGML_MODEL="${CP_GGML_MODEL:-/root/qwen3-tts.cpp/models/qwen3-tts-0.6b-q4_0.gguf}"
+# NOTE the 'cp-' in the name: that is what scripts/quantize_code_predictor_gguf.py
+# produces. The old default (qwen3-tts-0.6b-q4_0.gguf) matches no file on the board,
+# and because the backend probe is `[ -f $CP_GGML_MODEL ]`, a stale path silently
+# drops the pipeline onto the Python ONNX CP — measured 64 -> 390 ms per 15-step
+# request, i.e. 6x, with nothing in the log but the header line.
+CP_GGML_MODEL="${CP_GGML_MODEL:-/root/qwen3-tts.cpp/models/qwen3-tts-0.6b-cp-q8_0.gguf}"
 CP_GGML_THREADS="${CP_GGML_THREADS:-4}"
 
 # Vocoder (ONNX FP32 — RKNN Q8 has unusable quality due to Snake activation)
@@ -63,7 +68,7 @@ VOC_SOCKET="/tmp/qwen3_voc.sock"
 # Generation params
 TEMPERATURE="${TEMPERATURE:-0.8}"
 TOP_K="${TOP_K:-50}"
-MAX_TOKENS="${MAX_TOKENS:-200}"
+MAX_TOKENS="${MAX_TOKENS:-1000}"
 LANGUAGE="${LANGUAGE:-russian}"
 
 # --- Parse arguments ---
@@ -89,6 +94,19 @@ cleanup() {
         pid="${!pid_var}"
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null
+            # SIGTERM alone does not always work: the GGML code predictor blocks in
+            # accept() and its SIGTERM handler only flips a flag the serve loop
+            # re-reads after a connection, so an idle server can ignore the signal
+            # and outlive the daemon (measured: stale instances piling up to GBs).
+            # Give a short grace, then escalate to SIGKILL so teardown always reaps.
+            for _ in $(seq 1 6); do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 0.5
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -9 "$pid" 2>/dev/null
+                echo "  Killed PID $pid ($pid_var) (SIGKILL after 3s grace)"
+            fi
             wait "$pid" 2>/dev/null || true
             echo "  Stopped PID $pid ($pid_var)"
         fi
