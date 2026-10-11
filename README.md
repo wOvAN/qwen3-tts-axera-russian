@@ -119,6 +119,23 @@ python3 scripts/convert_vocoder_rknn.py --model models/vocoder_stateful_64.onnx 
 #        'stateful' — that is what selects the streaming path in server and client)
 ```
 
+**Optional, cuts TTFB:** export a second, small-B step and let it voice the *first* group of every
+utterance. A step pays the same fixed 5.2 MB cache round trip whatever B is, so 16 tokens cost
+almost the same as 64 — and 16 tokens is 1.28 s of audio the listener gets 7 s earlier:
+
+```bash
+python3 scripts/export_vocoder_stateful.py --codes-length 16 \
+    --output models/vocoder_stateful_16.onnx
+python3 scripts/convert_vocoder_rknn.py --model models/vocoder_stateful_16.onnx --stateful \
+    --output models/vocoder_stateful_16_fp16.rknn
+# board: VOCODER_MODEL=.../vocoder_stateful_64b_fp16.rknn \
+#        VOCODER_MODEL_FIRST=.../vocoder_stateful_16_fp16.rknn
+```
+
+`cache_numel` does not depend on B (conv tails + the 71-key window), so the B=16 step's `cache_out`
+feeds the B=64 step directly: mixed `[16,64,64,64]` vs a single full decode measures **110.4 dB**,
+max diff 1e-05. Without `VOCODER_MODEL_FIRST` the server keeps the single-model behaviour.
+
 Protocol (same socket, no new opcodes): the server **buffers** request tokens and steps only on
 full 64-token groups, so a request boundary in the middle of a group never zero-pads (padding
 writes silence into the caches — that alone cost 25 dB end to end). A `n_tokens=0` request
@@ -134,8 +151,12 @@ The NPU fp16 build forced four non-obvious choices, each measured:
 - **The attention mask is a graph constant at −100**, on the *relative* grid (`qp-kp`), so it is
   step-index free. −3e4 leaks through the NPU softmax (attention goes uniform); and an absolute
   mask fed as an *input* together with in-graph cos/sin segfaults the board runtime.
-- **Cache validity is a scalar input** (`cache_valid` = 0 on the first step of an utterance, 1
-  after). Deriving it from the cache data instead (an Abs/ReduceSum/Clip bias chain) costs 30 dB.
+- **Cache validity is a scalar input** — and it is a **count**, `cache_valid = min(pos, 71)`, not a
+  boolean. A boolean makes every step after the first treat the `Lc - B` never-written window slots
+  as real keys: a zero key scores 0 in the softmax, not −inf, so it steals mass from the real keys
+  (measured stepwise SNR 48.8 dB at B=64, 10.2 dB at B=16). The graph turns the count into a
+  per-slot additive bias with Sub/Clip/Mul. Deriving validity from the cache data instead (an
+  Abs/ReduceSum/Clip chain over the 1.3 MB cache) costs 30 dB.
 - **KV history joins through constant selection matmuls** (`A@cache_k + P@k`), not Concat: the
   RKNN Concat path corrupts sliding-window attention (9.5 dB vs 56.8 dB).
 
@@ -147,10 +168,17 @@ run of the *same* codes:
 | chunked seams (112-slot) | 26.4 dB | 57.5 / 21.1 / 29.7 | 6.5 tok/s | 6.0 s | 2.6x |
 | **stateful streaming** | **48.0 dB** | 56.2 / 44.5 / 51.1 / 53.4 | 7.5 tok/s | 0.0 s | **1.9x** |
 
+(the stateful row's SNR/RTF are from the pre-fix boolean-validity model; the fix only removes
+phantom-key mass, so the quality column can improve and the timings are unaffected — the B=16
+first-group run below, on the fixed exports, measures 7.6 tok/s / RTF 1.7x on a 443-token text)
+
 The stateful run never drops below 44 dB anywhere in the utterance (the chunked scheme loses 30 dB
 past its first seam), and it stops stealing A76 cores from the code predictor, so generation itself
-gets faster. The fp32 self-check of the export (stepwise vs full decode, `--check-only`) is 48.8 dB
-— the kv-selection matmuls' fp32 accumulation noise, not a semantic error.
+gets faster. The fp32 self-check of the export (stepwise vs full decode, `--check-only`) is 111.4 dB
+at B=64 and 103.7 dB at B=16 (onnxruntime re-run of the exported graph: 111.1 / 103.1) — the
+residual is the kv-selection matmuls' fp32 accumulation noise, not a semantic error. (Before the
+cache-validity count fix the same check read 48.8 dB, which is why its threshold is 40 dB: the
+export aborts *before* `torch.onnx.export` and a stale ONNX is left for the converter.)
 
 ### Optimization Journey
 
@@ -164,16 +192,20 @@ gets faster. The fp32 self-check of the export (stepwise vs full decode, `--chec
 | + ffn_down cast fix | GGML Q8_0 (64ms/15 steps) | ONNX FP32 | 2.6x (3.0x streaming) |
 | + RKNN FP16 vocoder on NPU | GGML Q8_0 (64ms/15 steps) | **RKNN FP16 (112-tok chunks)** | 1.8x |
 | + stateful streaming vocoder | GGML Q8_0 (64ms/15 steps) | **RKNN FP16 stateful (no chunks)** | **1.9x** |
+| + 16-token first group | GGML Q8_0 (64ms/15 steps) | **RKNN FP16 stateful (B=16 + B=64)** | **1.7x** |
 
-The last three rows are measured on this board (Russian text, 4×A76; the cast-fix row is
-non-streaming, the other two `--streaming`); the CP times in the rows above are the
+The last four rows are measured on this board (Russian text, 4×A76; the cast-fix row is
+non-streaming, the other three `--streaming`); the CP times in the rows above are the
 upstream-reported ones. The 1.8x and 1.9x rows are different texts (137 / 200 tokens) — the
 stateful path's own A/B against the chunked-seam vocoder on one fixed 200-token text is
-2.6x → 1.9x.
+2.6x → 1.9x, and the 1.7x row is a 443-token text.
 
-Streaming TTFB on the stateful path is **≈9.3 s**: the first 64-token chunk is submitted at +5.7 s
-and the stateful vocoder step takes 3.6 s (19–23 s with the FP32-CPU vocoder). The code predictor —
-63% of per-token CPU time — is the one component the NPU does *not* help: the stateful step graph
+Streaming TTFB on the stateful path is **≈9.3 s** with a single B=64 export: the first 64-token
+chunk is submitted at +5.7 s and the stateful vocoder step takes 3.6 s (19–23 s with the FP32-CPU
+vocoder). With the B=16 first-group model above it is **2.4 s** (measured: first audio at +2.4 s,
+1.28 s of it, on a 948-char Russian request, 4×A76, both models FP16 on the NPU). The code
+predictor — 63% of per-token CPU time — is the one component the NPU does *not* help: the stateful
+step graph
 (`scripts/export_code_predictor_stateful.py` + `scripts/convert_code_predictor_rknn.py`, verified
 15/15 codebooks and 2.8e-05 step-0 logit diff against an fp64 reference) runs at **23.2 ms/step on
 the three NPU cores against 4.3 ms/step on 4×A76** with GGML Q8_0 — 5.4x slower. 157 MB of fp16
@@ -241,6 +273,9 @@ The pipeline supports three code predictor backends (auto-selected):
    `python3 scripts/export_vocoder_stateful.py --codes-length 64 --output models/vocoder_stateful_64.onnx`
    then `python3 scripts/convert_vocoder_rknn.py --model models/vocoder_stateful_64.onnx --stateful`
    — see [Vocoder: stateful streaming](#vocoder-stateful-streaming-no-chunks).
+5c. (Recommended, TTFB) Repeat 5b with `--codes-length 16` and pass the result as
+   `VOCODER_MODEL_FIRST` — the first 16 tokens of every utterance then get voiced by the small
+   model: first audio 9.3 s → 2.4 s.
 6. (Optional) Convert GGML code predictor: see [qwen3-tts.cpp](https://github.com/nickovchinnikov/qwen3-tts.cpp)
 7. (Recommended) Shrink + quantize the GGML code-predictor model:
    `python3 scripts/quantize_code_predictor_gguf.py --in <f16.gguf> --out <cp-q8_0.gguf>` and point
@@ -265,6 +300,7 @@ See [docs/MODEL_CONVERSION.md](docs/MODEL_CONVERSION.md) for details.
 └── vocoder/
     ├── vocoder_traced_64.onnx           # Vocoder FP32 (93 MB)
     └── vocoder_stateful_64_fp16.rknn    # Vocoder FP16, stateful streaming step (248 MB)
+        (+ vocoder_stateful_16_fp16.rknn  # the same step at B=16, voices the first group)
 ```
 
 ## Build llama_wrapper.so

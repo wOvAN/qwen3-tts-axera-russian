@@ -108,9 +108,12 @@ state**: 4 inputs `audio_codes [1,16,B] int64` / `freqs_in [B,32] fp32` / `cache
 `cache_in [1303424] fp32`, 2 outputs `audio_values` / `cache_out`. The flat cache is every causal
 conv's tail plus the pre-transformer's sliding-window KV (8 layers × 2 × 16 heads × 71 × 64), in
 the order of `StatefulDecoder.specs` — change `B` (`--codes-length`) and you must reconvert the
-RKNN model, whose input sizes `convert_vocoder_rknn.py --stateful` hardcodes. `vocoder_server.py`
-and `tts_client.py` both switch on the substring `stateful` in the model filename
-(`VOCODER_MODEL`), and the server takes `B` from the same `_(\d+)` filename regex.
+RKNN model, whose input sizes `convert_vocoder_rknn.py --stateful` hardcodes. `cache_numel` does
+**not** depend on B, so a B=16 step's `cache_out` feeds a B=64 step directly (measured: mixed
+`[16,64,64,64]` vs a single full decode = 110.4 dB, max diff 1e-05) — that is the whole basis of
+the two-tier first chunk. `vocoder_server.py` and `tts_client.py` both switch on the substring
+`stateful` in the model filename (`VOCODER_MODEL`), and the server takes `B` from the same
+`_(\d+)` filename regex.
 
 Protocol: the server **buffers** request tokens and steps only on full `B`-token groups — a request
 boundary in the middle of a group must never be zero-padded, padding writes silence into the caches
@@ -125,8 +128,11 @@ section): RoPE angles as host inputs reduced mod 2π with cos/sin computed in-gr
 inputs explodes the pipeline; raw angles hit fp16 ulp 0.5 at pos ~1e3), the sliding-window mask as
 a graph constant at −100 on the relative grid (−3e4 leaks through the NPU softmax; an absolute mask
 as an *input* plus in-graph cos/sin SEGFAULTs the board runtime), cache validity as a scalar input
-(a data-dependent Abs/ReduceSum/Clip chain costs 30 dB), and KV history joined by constant selection
-matmuls instead of Concat (the RKNN Concat path corrupts sliding-window attention: 9.5 dB vs 56.8).
+carrying the **count** of real slots `min(pos, 71)` — a boolean leaks the never-written slots into
+the softmax (a zero key scores 0, not −inf) and costs 62 dB, while deriving the count from the cache
+data (a data-dependent Abs/ReduceSum/Clip chain) costs 30 dB — and KV history joined by constant
+selection matmuls instead of Concat (the RKNN Concat path corrupts sliding-window attention:
+9.5 dB vs 56.8).
 
 ### Why the vocoder is FP32 on CPU (superseded: FP16 on NPU is lossless)
 
@@ -280,9 +286,23 @@ What does not work as shipped:
   zones 56.2/44.5/51.1/53.4, generation 7.5 tok/s, vocoder wait 0.0 s, **RTF 1.9x**. The stateful
   run never drops below 44 dB anywhere, i.e. no seam-shaped relaxation at all, and the vocoder no
   longer competes with the CP for the A76 cores. The export's own fp32 self-check (stepwise vs
-  full decode) is 48.8 dB — the kv-selection matmuls' fp32 accumulation noise; the export's check
-  threshold is therefore 40 dB, do not raise it back to 80 (it aborts *before*
-  `torch.onnx.export`, which then leaves a stale ONNX for the converter to load).
+  full decode) is 111.4 dB at B=64 / 103.7 dB at B=16 (onnxruntime re-run: 111.1 / 103.1) — the
+  residual is the kv-selection matmuls' fp32 accumulation noise; the export's check threshold is
+  40 dB, do not raise it back to 80 (it aborts *before* `torch.onnx.export`, which then leaves a
+  stale ONNX for the converter to load). Before the cache-validity-count fix the same check read
+  48.8 dB, so the board numbers in this bullet are from a model 62 dB below its own tolerance.
+- **Phantom KV slots: `cache_valid` must be a COUNT, not a flag** (see the contract above). The
+  deployed NPU vocoder scored 48.8 dB (B=64) / 10.2 dB (B=16) stepwise because a boolean flag told
+  every step after the first that all 71 window slots held real keys. Fixed in the exporter
+  (per-slot bias from `Lc - n_valid - slot_idx`, `-100.0 * phantom` — the inverted sign scores
+  5.4 dB, real bug caught by the self-check) and in `vocoder_server.py` (`min(pos, kv_len)`).
+- **Two-tier first chunk: TTFB 9.3 → 2.4 s.** A stateful step pays the same fixed 5.2 MB cache
+  round trip at any B, so the client sends the first 16 tokens as soon as they exist
+  (`VOC_FIRST_CHUNK`, stateful only — a chunked-seam server zero-pads a short request) and the
+  server voices that group on a second RKNN context (`--model_first` / `VOCODER_MODEL_FIRST`,
+  `vocoder_stateful_16_fp16.rknn`). Measured on the board, 948-char Russian text, `--streaming`,
+  4×A76: first audio **+2.4 s** (1.28 s of it), 443 tokens → 35.44 s audio (complete),
+  7.6 tok/s, RTF 1.7x. The client prints that line itself (`<- First audio: ... +X.X s`).
 - **Code predictor on the NPU — built, measured, rejected (do not rebuild the backend).**
   `scripts/export_code_predictor_stateful.py` (one stateful decode step, KV cache in graph I/O:
   14 inputs / 11 outputs, ONE graph for all 16 positions because the per-token sequence is exactly
@@ -312,7 +332,8 @@ What does not work as shipped:
   (1-pos hidden diff 15.6, 0/15 codebooks).
 - Streaming TTFB on the stateful path, measured: client start → first 64-token chunk submitted
   +5.7 s, stateful vocoder step 3.6 s → **first audio ≈ 9.3 s** (was 19-23 s on the FP32-CPU
-  vocoder, 6.6 s to chunk submission after the cast fix).
+  vocoder, 6.6 s to chunk submission after the cast fix). Cut to 2.4 s by the two-tier first chunk
+  above.
 - **Long utterances: `n_ctx` 512 → `N_CTX` 2048, `n_batch` decoupled, per-request token budget.**
   `n_ctx=512` + `MAX_TOKENS=200` truncated a long text mid-phrase (no forced EOS — the talker just
   sends `SENTINEL_DONE`), while the model's adaptive EOS wants ~3× the text-token count (forced at

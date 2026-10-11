@@ -111,6 +111,23 @@ python3 scripts/convert_vocoder_rknn.py --model models/vocoder_stateful_64.onnx 
 #       'stateful'——服务器和客户端就是靠它选择流式路径）
 ```
 
+**可选，降低 TTFB：** 再导出一个小 B 的步，用它发声每句话的*第一*组 token。一步的固定开销是
+那 5.2 MB 缓存往返，与 B 无关，所以 16 个 token 几乎和 64 个一样便宜——而这是 1.28 秒音频，
+听者早 7 秒听到：
+
+```bash
+python3 scripts/export_vocoder_stateful.py --codes-length 16 \
+    --output models/vocoder_stateful_16.onnx
+python3 scripts/convert_vocoder_rknn.py --model models/vocoder_stateful_16.onnx --stateful \
+    --output models/vocoder_stateful_16_fp16.rknn
+# 板端：VOCODER_MODEL=.../vocoder_stateful_64b_fp16.rknn \
+#       VOCODER_MODEL_FIRST=.../vocoder_stateful_16_fp16.rknn
+```
+
+`cache_numel` 与 B 无关（卷积尾部 + 71 键的窗口），所以 B=16 那步的 `cache_out` 可以直接喂给
+B=64 那步：混合 `[16,64,64,64]` 对单次完整解码测得 **110.4 dB**，最大差 1e-05。不设
+`VOCODER_MODEL_FIRST` 时服务器保持单模型行为。
+
 协议（同一 socket，无新操作码）：服务器**缓冲**请求里的 token，只在凑满 64 个一组时前进，因此
 请求边界落在组中间时绝不做零填充（零填充会把静音写进缓存——仅此一项端到端就损失 25 dB）。
 `n_tokens=0` 的请求就是 **flush**：把剩余的不足 64 个 token 发声并返回其音频，然后清零状态。客户端
@@ -125,8 +142,11 @@ NPU 的 fp16 构建强制了四个不显然的选择，每个都经过测量：
 - **attention mask 是图内常量，取值 −100**，建立在*相对*网格（`qp-kp`）上，因此与步序号无关。
   −3e4 会穿透 NPU 的 softmax（注意力变均匀）；而把绝对 mask 作为*输入*并与图内 cos/sin 同时使用，
   会让板端运行时 SEGFAULT。
-- **缓存有效性是标量输入**（`cache_valid`：一句话的第一步为 0，之后为 1）。改从缓存数据推导它
-  （Abs/ReduceSum/Clip 偏置链）会损失 30 dB。
+- **缓存有效性是标量输入**——而且是一个**计数**，`cache_valid = min(pos, 71)`，不是布尔标志。
+  用标志时，第一步之后的每一步都会把 `Lc - B` 个从未写入的窗口槽当成真实 key：零值 key 在 softmax
+  里得分是 0 而不是 −inf，于是从真实 key 那里抢走质量（逐步 SNR：B=64 时 48.8 dB，B=16 时
+  10.2 dB）。图里用 Sub/Clip/Mul 把该计数变成逐 slot 的加性偏置。改从缓存数据推导有效性
+  （对 1.3 MB 缓存做 Abs/ReduceSum/Clip 偏置链）会损失 30 dB。
 - **KV 历史通过常量选择矩阵乘接入**（`A@cache_k + P@k`），而不是 Concat：RKNN 的 Concat 路径会
   破坏滑动窗口注意力（9.5 dB 对 56.8 dB）。
 
@@ -139,8 +159,12 @@ NPU 的 fp16 构建强制了四个不显然的选择，每个都经过测量：
 | **有状态流式** | **48.0 dB** | 56.2 / 44.5 / 51.1 / 53.4 | 7.5 tok/s | 0.0 s | **1.9x** |
 
 有状态方案在整句话中任何位置都不低于 44 dB（分块方案在第一个接缝之后就掉 30 dB），并且它不再从
-code predictor 手里抢 A76 核，所以生成本身也变快了。导出的 fp32 自检（逐步 vs 完整解码，
-`--check-only`）为 48.8 dB——那是 KV 选择矩阵乘的 fp32 累加噪声，不是语义错误。
+code predictor 手里抢 A76 核，所以生成本身也变快了。（有状态这一行是在缓存有效性修复之前的模型上
+测的；修复只是从幻影 key 那里拿走质量，所以质量列只会变好，计时不受影响——下面用修复后的导出跑
+16-token 首组的实测在 443 token 文本上是 7.6 tok/s / RTF 1.7x。）导出的 fp32 自检（逐步 vs 完整
+解码，`--check-only`）在 B=64 时为 111.4 dB，B=16 时为 103.7 dB（用 onnxruntime 重跑导出的图：
+111.1 / 103.1）——残差是 KV 选择矩阵乘的 fp32 累加噪声，不是语义错误。（修复前同一检查是 48.8 dB，
+所以它的阈值是 40 dB：导出会在 `torch.onnx.export` *之前*中止，从而给转换器留下一个过期的 ONNX。）
 
 ### 优化历程
 
@@ -152,13 +176,16 @@ code predictor 手里抢 A76 核，所以生成本身也变快了。导出的 fp
 | + 修复 ffn_down cast | GGML Q8_0 (64ms/15步) | ONNX FP32 | 2.6x（流式 3.0x） |
 | + RKNN FP16 声码器上 NPU | GGML Q8_0 (64ms/15步) | **RKNN FP16（112 token 分块）** | 1.8x |
 | + 有状态流式声码器 | GGML Q8_0 (64ms/15步) | **RKNN FP16 有状态（无分块）** | **1.9x** |
+| + 首组 16 token | GGML Q8_0 (64ms/15步) | **RKNN FP16 有状态（B=16 + B=64）** | **1.7x** |
 
-最后三行是在本板卡实测（俄语文本，4×A76；修复 cast 那行是非流式，其余两行 `--streaming`）；
-上面各行的 CP 耗时是上游报告的数值。1.8x 与 1.9x 两行文本长度不同（137 / 200 token）——
-有状态路径与分块接缝声码器在同一 200 token 文本上的 A/B 是 2.6x → 1.9x。
+最后四行是在本板卡实测（俄语文本，4×A76；修复 cast 那行是非流式，其余三行 `--streaming`）；
+上面各行的 CP 耗时是上游报告的数值。1.8x、1.9x 与 1.7x 三行文本长度不同（137 / 200 / 443
+token）——有状态路径与分块接缝声码器在同一 200 token 文本上的 A/B 是 2.6x → 1.9x。
 
-有状态路径的流式 TTFB 为 **≈9.3 秒**：首个 64-token 分块在 +5.7 秒提交，有状态声码器一步 3.6 秒
-（FP32-CPU 声码器时代是 19–23 秒）。code predictor 占每个 token 的 63% CPU 时间，也是唯一
+有状态路径的流式 TTFB：单个 B=64 导出时 **≈9.3 秒**——首个 64-token 分块在 +5.7 秒提交，有状态
+声码器一步 3.6 秒（FP32-CPU 声码器时代是 19–23 秒）；加上 16-token 首组模型后是 **2.4 秒**（实测：
+首个音频在 +2.4 秒，其中 1.28 秒音频，948 字符俄语文本，4×A76，两个模型都是 NPU 上的 FP16）。
+code predictor 占每个 token 的 63% CPU 时间，也是唯一
 NPU *帮不上忙*的组件：有状态单步图（`scripts/export_code_predictor_stateful.py` +
 `scripts/convert_code_predictor_rknn.py`，自检 15/15 码本、首步 logit 相对 fp64 参考差 2.8e-05）
 在三个 NPU 核上是 **23.2 ms/步，而 4×A76 + GGML Q8_0 是 4.3 ms/步——慢 5.4 倍**。157 MB fp16
