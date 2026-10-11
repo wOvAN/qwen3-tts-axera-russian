@@ -168,9 +168,13 @@ run of the *same* codes:
 | chunked seams (112-slot) | 26.4 dB | 57.5 / 21.1 / 29.7 | 6.5 tok/s | 6.0 s | 2.6x |
 | **stateful streaming** | **48.0 dB** | 56.2 / 44.5 / 51.1 / 53.4 | 7.5 tok/s | 0.0 s | **1.9x** |
 
-(the stateful row's SNR/RTF are from the pre-fix boolean-validity model; the fix only removes
-phantom-key mass, so the quality column can improve and the timings are unaffected — the B=16
-first-group run below, on the fixed exports, measures 7.6 tok/s / RTF 1.7x on a 443-token text)
+(the stateful row's SNR is from the pre-fix boolean-validity model, and re-measuring that same
+model file against a torch-fp32 full decode of the same 144 recorded codes gives global **25.1 dB**
+with zones 55.6 / 21.3 / 23.8 — the decay starts exactly at the second step, which is where phantom
+keys first exist. The fixed exports measure **54.3 dB** (zones 55.6 / 53.4 / 51.7, flat) and the
+shipped B=16 + B=64 path **53.9 dB** (55.0 / 53.5 / 50.7): the small first group costs 0.4 dB, i.e.
+nothing. All three float32 in-process, no int16 round trip, 3 steps of 64 in 10.8 s vs 3 steps
+(16+64+64) in 8.1 s.)
 
 The stateful run never drops below 44 dB anywhere in the utterance (the chunked scheme loses 30 dB
 past its first seam), and it stops stealing A76 cores from the code predictor, so generation itself

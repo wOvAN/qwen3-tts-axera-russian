@@ -291,6 +291,13 @@ What does not work as shipped:
   40 dB, do not raise it back to 80 (it aborts *before* `torch.onnx.export`, which then leaves a
   stale ONNX for the converter to load). Before the cache-validity-count fix the same check read
   48.8 dB, so the board numbers in this bullet are from a model 62 dB below its own tolerance.
+  Re-measured on the board after the fix, same 144 recorded codes, float32 in-process, reference =
+  torch-fp32 full decode: pre-fix `vocoder_stateful_64_fp16.rknn` **25.1 dB** (zones
+  55.6/21.3/23.8 — decay starts at the second step, where phantom keys first exist), fixed
+  `vocoder_stateful_64b_fp16.rknn` **54.3 dB** (55.6/53.4/51.7, flat), shipped
+  B=16+B=64 **53.9 dB** (55.0/53.5/50.7) — the small first group costs 0.4 dB. Script
+  `/tmp/snr_board.py` + `/tmp/rec_codes.py` (records real codes through the live talker+CP) on the
+  board, `/tmp/ref_decode.py` (the fp32 reference) on the host.
 - **Phantom KV slots: `cache_valid` must be a COUNT, not a flag** (see the contract above). The
   deployed NPU vocoder scored 48.8 dB (B=64) / 10.2 dB (B=16) stepwise because a boolean flag told
   every step after the first that all 71 window slots held real keys. Fixed in the exporter
