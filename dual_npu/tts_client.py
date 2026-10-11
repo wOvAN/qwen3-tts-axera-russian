@@ -52,6 +52,7 @@ def find_pause(x, min_len=3600, win=480):
 
 
 VOC_CHUNK_SIZE = 64  # new tokens per streaming vocoder chunk
+VOC_FIRST_CHUNK = 16 # tokens in the FIRST streaming chunk (TTFB; see below)
 VOC_CTX = 48         # tokens of real context prepended per chunk (model = 112)
 VOC_SLOTS = 112      # fixed vocoder model input size
 # The vocoder protocol (stateful streaming vs chunked seams) is probed against the
@@ -138,6 +139,7 @@ class Qwen3TTSClient:
         self.voc_socket = voc_socket
         # vocoder protocol, probed once per utterance in synthesize()
         self.stateful = None
+        self.t0 = time.time()
 
         # Load codec_embedding for feedback computation
         if embeddings_dir:
@@ -249,6 +251,10 @@ class Qwen3TTSClient:
             if n_ctx:
                 audio = audio[n_ctx * SAMPLES_PER_TOKEN:]
             results[chunk_idx] = audio
+            if chunk_idx == 0:
+                # TTFB: the moment the listener would hear anything.
+                print(f"  <- First audio: {len(audio) / SAMPLE_RATE:.2f} s at "
+                      f"+{time.time() - self.t0:.1f} s")
         except Exception as e:
             print(f"  Vocoder chunk {chunk_idx} error: {e}")
             results[chunk_idx] = np.array([], dtype=np.int16)
@@ -265,6 +271,7 @@ class Qwen3TTSClient:
         print(f"Language: {language}")
 
         t_start = time.time()
+        self.t0 = t_start
 
         # Ask the vocoder server which protocol it speaks (stateful streaming or
         # chunked seams) before generating anything. On a stateful server this
@@ -344,7 +351,16 @@ class Qwen3TTSClient:
             # starts at the quietest point in the last 1.5 s of chunk k's
             # audio (adaptive seam), so stitch() joins chunks inside a
             # pause instead of mid-phrase.
-            if streaming and len(all_codes) - next_start >= VOC_CHUNK_SIZE:
+            # The FIRST streaming chunk is small: it is the audio the listener
+            # waits for, and a stateful step costs the same fixed cache traffic
+            # (5.2 MB in and out) whatever B is, so voicing 16 tokens early is
+            # nearly free. Stateful only — a chunked-seam server pads a short
+            # request to its full slot count, and a zero-padded chunk start is a
+            # different waveform (the "double voice" defect).
+            chunk_n = (VOC_FIRST_CHUNK
+                       if (self.stateful and voc_chunk_idx == 0)
+                       else VOC_CHUNK_SIZE)
+            if streaming and len(all_codes) - next_start >= chunk_n:
                 if voc_threads and not self.stateful:
                     voc_threads[-1].join()
                     a = voc_results.get(voc_chunk_idx - 1)
@@ -361,7 +377,7 @@ class Qwen3TTSClient:
                         # the shared overlap
                         voc_results[voc_chunk_idx - 1] = a[:(seam - last_start + 2) * SAMPLES_PER_TOKEN]
                         next_start = seam
-                take = all_codes[next_start:next_start + VOC_CHUNK_SIZE]
+                take = all_codes[next_start:next_start + chunk_n]
                 prev_tail = all_codes[max(0, next_start - VOC_CTX):next_start]
                 t = threading.Thread(
                     target=self._vocoder_chunk,
@@ -370,7 +386,7 @@ class Qwen3TTSClient:
                 voc_threads.append(t)
                 print(f"  -> Vocoder chunk {voc_chunk_idx} ({len(take)} tokens @ {next_start}) submitted")
                 last_start = next_start
-                next_start += VOC_CHUNK_SIZE
+                next_start += chunk_n
                 voc_chunk_idx += 1
 
             # Feedback: code_0=talker embed, codes 1-15=CP per-group embeds

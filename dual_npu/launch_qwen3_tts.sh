@@ -57,8 +57,12 @@ CP_GGML_BINARY="${CP_GGML_BINARY:-/root/qwen3-tts.cpp/build/code_pred_server}"
 CP_GGML_MODEL="${CP_GGML_MODEL:-/root/qwen3-tts.cpp/models/qwen3-tts-0.6b-cp-q8_0.gguf}"
 CP_GGML_THREADS="${CP_GGML_THREADS:-4}"
 
-# Vocoder (ONNX FP32 — RKNN Q8 has unusable quality due to Snake activation)
+# Vocoder (RKNN FP16 on the NPU — Snake activation makes every *quantized* build
+# unusable, FP16 is not quantized and measures lossless)
 VOCODER_MODEL="${VOCODER_MODEL:-${BASE_DIR}/vocoder/vocoder_traced_64.onnx}"
+# Stateful models only: a small-B export voices the FIRST group of each utterance,
+# which is the audio the listener waits for (TTFB). Empty = single-model behaviour.
+VOCODER_MODEL_FIRST="${VOCODER_MODEL_FIRST:-}"
 
 # Sockets
 TALKER_SOCKET="/tmp/qwen3_talker.sock"
@@ -218,6 +222,7 @@ rm -f "$VOC_SOCKET"
 # Vocoder on its own cores: in streaming mode it runs concurrently with generation
 OPENBLAS_NUM_THREADS=1 taskset -c "$VOC_CORES" "$PYTHON" -u "${SCRIPT_DIR}/vocoder_server.py" \
     --model "$VOCODER_MODEL" \
+    ${VOCODER_MODEL_FIRST:+--model_first "$VOCODER_MODEL_FIRST"} \
     --socket "$VOC_SOCKET" &
 VOC_PID=$!
 
