@@ -310,6 +310,15 @@ What does not work as shipped:
   `vocoder_stateful_16_fp16.rknn`). Measured on the board, 948-char Russian text, `--streaming`,
   4×A76: first audio **+2.4 s** (1.28 s of it), 443 tokens → 35.44 s audio (complete),
   7.6 tok/s, RTF 1.7x. The client prints that line itself (`<- First audio: ... +X.X s`).
+  Click audit of the shipped path (all negative, `/tmp/click{,2,3}.py`, `/tmp/phase_test.py`,
+  `/tmp/pad_test.py` on the board): `mix16` and `new64b` have identical per-token diff envelopes
+  (the B=16→B=64 handoff adds no localized artifact); the flush path's zero padding costs
+  **0.0 dB** (tails of 1/14/44 tokens vs no padding, same zones); no clipping (max |a| 0.95-0.97,
+  zero samples >0.9999); zero sample-domain discontinuities above the click threshold in the
+  shipped files, same signature as the single-B=64 control; and the 12.5 Hz phase-locked texture
+  (peak 1.70x median at phase 1073) is present in the fp32 full decode too, i.e. it is the
+  decoder's own lattice, not streaming. If a listener reports clicks, suspect the **pre-fix**
+  samples (`/tmp/ab_stream_*.wav`, the 25 dB model), not this path.
 - **Code predictor on the NPU — built, measured, rejected (do not rebuild the backend).**
   `scripts/export_code_predictor_stateful.py` (one stateful decode step, KV cache in graph I/O:
   14 inputs / 11 outputs, ONE graph for all 16 positions because the per-token sequence is exactly
