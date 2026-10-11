@@ -121,7 +121,8 @@ def stitch(a, b, Wmax=SAMPLE_RATE, K=480, Fd=960, Fm=480, G=2400,
 
 
 class VocoderServer:
-    def __init__(self, model_path, socket_path="/tmp/qwen3_voc.sock"):
+    def __init__(self, model_path, socket_path="/tmp/qwen3_voc.sock",
+                 first_model_path=None):
         self.socket_path = socket_path
         self.is_onnx = model_path.endswith('.onnx')
         self.stateful = 'stateful' in os.path.basename(model_path)
@@ -169,6 +170,24 @@ class VocoderServer:
             self.kv_len = STATEFUL_KV_LEN
             print("Vocoder: stateful streaming mode (no chunk seams)")
 
+            # First-step model (TTFB): the cache layout is B-independent (conv
+            # tails + a fixed 71-key KV window), so a small-B export can voice
+            # the first group and hand its cache straight to the big one. The
+            # first chunk is what the listener waits for: 64 tokens = 5.12 s of
+            # audio at ~11 tok/s, 16 tokens = 1.28 s.
+            self.first = None
+            if first_model_path and self.stateful and not self.is_onnx:
+                net = RKNNLite()
+                if net.load_rknn(first_model_path) != 0:
+                    raise RuntimeError(
+                        f"Failed to load first-step RKNN vocoder: {first_model_path}")
+                if net.init_runtime(core_mask=RKNNLite.NPU_CORE_0_1_2) != 0:
+                    raise RuntimeError("Failed to init first-step RKNN vocoder")
+                m = re.search(r"_(\d+)", os.path.basename(first_model_path))
+                self.first = (net, int(m.group(1)) if m else 16)
+                print(f"Vocoder: first step uses {self.first[1]} tokens "
+                      f"({self.first[1] * 1920 / 24000:.2f} s of audio)")
+
         self._running = True
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -182,7 +201,7 @@ class VocoderServer:
         else:
             return self.rknn.inference(inputs=[padded])[0].flatten()
 
-    def _inference_stateful(self, padded, pos):
+    def _inference_stateful(self, padded, pos, net=None):
         L = padded.shape[2]
         p = pos + np.arange(L, dtype=np.float32)
         # RoPE angles reduced mod 2*pi (fp32 trig on host; the graph computes
@@ -192,16 +211,18 @@ class VocoderServer:
         # cache-validity bias), no mask input.
         freqs = np.remainder(np.outer(p, self.inv_freq),
                              2 * np.pi).astype(np.float32)
-        # 0.0 on the first step of an utterance (cache slots never written),
-        # 1.0 after — masks the empty history slots inside the graph
-        cv = (np.zeros if pos == 0 else np.ones)(1, np.float32)
+        # how many cache slots hold real keys (the rolling window fills from the
+        # right); the graph masks the rest. A boolean 'any history' here leaks
+        # Lc - B never-written zero keys into the softmax: measured stepwise SNR
+        # 48.8 dB at B=64 and 10.2 dB at B=16, vs 111.4 / 103.7 dB with the count.
+        cv = np.full(1, min(pos, self.kv_len), dtype=np.float32)
         if self.is_onnx:
             w, c = self.sess.run(None, {
                 'audio_codes': padded, 'freqs_in': freqs,
                 'cache_valid': cv, 'cache_in': self.cache})
         else:
             # w16a16 build stores fp32 inputs as fp16
-            w, c = self.rknn.inference(
+            w, c = (net or self.rknn).inference(
                 inputs=[padded, freqs.astype(np.float16),
                         cv.astype(np.float16),
                         self.cache.astype(np.float16)])
@@ -220,13 +241,23 @@ class VocoderServer:
         if self.stateful:
             self.buf = np.concatenate([self.buf, codes_array])
             out = []
-            while len(self.buf) >= self.max_tokens:
-                seg = self.buf[:self.max_tokens]
-                self.buf = self.buf[self.max_tokens:]
-                padded = np.zeros((1, 16, self.max_tokens), dtype=np.int64)
+            while True:
+                # The first group of an utterance runs on the small model: it is
+                # the audio the listener waits for, and a step costs the same
+                # fixed cache traffic (5.2 MB in and out) whatever B is, so
+                # voicing 16 tokens early is nearly free.
+                n = (self.first[1] if self.first and self.pos == 0
+                     else self.max_tokens)
+                if len(self.buf) < n:
+                    break
+                seg = self.buf[:n]
+                self.buf = self.buf[n:]
+                padded = np.zeros((1, 16, n), dtype=np.int64)
                 padded[0] = seg[:, :16].T
-                out.append(self._inference_stateful(padded, self.pos))
-                self.pos += self.max_tokens
+                out.append(self._inference_stateful(
+                    padded, self.pos,
+                    self.first[0] if n != self.max_tokens else None))
+                self.pos += n
             return (np.concatenate(out) if out
                     else np.array([], dtype=np.float32))
 
@@ -385,6 +416,8 @@ class VocoderServer:
             os.unlink(self.socket_path)
         if not self.is_onnx:
             self.rknn.release()
+            if self.first:
+                self.first[0].release()
         print("Vocoder Server stopped.")
 
 
@@ -392,9 +425,13 @@ def main():
     parser = argparse.ArgumentParser(description="Qwen3-TTS Vocoder Server")
     parser.add_argument("--model", required=True, help="Vocoder model (.rknn or .onnx)")
     parser.add_argument("--socket", default="/tmp/qwen3_voc.sock")
+    parser.add_argument("--model_first", default=None,
+                        help="Stateful model with a small B for the first group of "
+                             "each utterance (TTFB); same cache layout, any B")
     args = parser.parse_args()
 
-    server = VocoderServer(model_path=args.model, socket_path=args.socket)
+    server = VocoderServer(model_path=args.model, socket_path=args.socket,
+                           first_model_path=args.model_first)
     server.serve()
 
 

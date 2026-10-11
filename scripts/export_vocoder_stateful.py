@@ -104,24 +104,28 @@ class StatefulDecoder(torch.nn.Module):
         # through the NPU softmax). The training mask's (kp>=0) guard — "no
         # history before token 0" — cannot be a relative constant; feeding an
         # absolute mask as an input together with in-graph Cos/Sin segfaults
-        # the board runtime, so validity of the cache slots is derived from
-        # the cache itself in forward(): a never-written slot is all-zero,
-        # bias = 100*(min(1, 1e3*sum|k_slot|) - 1) in {0, -100}, all ops the
-        # NPU supports (no comparison/Where).
+        # the board runtime, so the cache slots carry a per-slot bias built in
+        # forward() from the host-supplied count of real slots (see forward).
         qp = torch.arange(B, dtype=torch.float32).view(B, 1)
         kp = (torch.arange(self.Lc + B, dtype=torch.float32)
               - self.Lc).view(1, self.Lc + B)
         m = torch.where((kp <= qp) & (kp > qp - self.Lc - 1),
                         torch.zeros(()), torch.full((), -100.0))
         self.register_buffer("attn_mask", m.view(1, 1, B, self.Lc + B))
-        # 1.0 on the Lc history slots, 0.0 on the B current slots: combined
-        # with the host-supplied cache_valid scalar (0.0 on the first step of
-        # an utterance, 1.0 after), mask += hist_ind*(cv-1)*100 masks the
-        # never-written cache slots at step 0. (A data-dependent validity
-        # derived from the cache — Abs/ReduceSum/Clip chain — costs 30 dB of
-        # NPU fp16 accuracy; the scalar input is exact.)
-        hi = torch.cat([torch.ones(self.Lc), torch.zeros(B)])
-        self.register_buffer("hist_ind", hi.view(1, 1, 1, self.Lc + B))
+        # Slot index of the Lc history slots, for the per-slot validity bias
+        # built in forward() from the host-supplied count of real slots.
+        self.register_buffer("slot_idx",
+                             torch.arange(self.Lc, dtype=torch.float32)
+                             .view(1, 1, 1, self.Lc))
+
+    def _slot_bias(self, n_valid):
+        """Additive attention bias for the Lc cache slots + the B current ones:
+        -100 on the Lc - n_valid never-written slots (exp(-100) = 0 exactly in
+        fp16), 0 on the real ones. Elementwise on a [1,1,1,Lc] grid."""
+        phantom = torch.clamp(self.Lc - n_valid - self.slot_idx, 0.0, 1.0)
+        bias = -100.0 * phantom                   # [1,1,1,Lc] in {-100, 0}
+        cur = torch.zeros(1, 1, 1, self.B)
+        return torch.cat([bias, cur], dim=-1)     # [1,1,1,Lc+B]
 
     def _split(self, flat):
         out, off = {}, 0
@@ -160,10 +164,20 @@ class StatefulDecoder(torch.nn.Module):
 
     def forward(self, codes, freqs, cache_valid, flat_cache):
         """freqs [B, head_dim/2] = RoPE angles (pos*inv_freq) reduced mod 2*pi
-        on the host (fp32 trig there; the reduced angles are fp16-safe), Cos/Sin
-        computed IN the graph. RoPE fed as cos/sin input tensors explodes on the
-        RK3588 NPU (measured: q rms 0.68 -> 120 through q*cos+rot(q)*sin with
-        bounded inputs; in-graph Cos/Sin is clean, 55 dB)."""
+        on the host (cos/sin computed in-graph; feeding cos/sin as RKNN inputs
+        explodes the NPU fp16 pipeline, and raw angles > ~1e3 lose fp16
+        precision).
+        cache_valid [1] = how many of the Lc cache slots hold REAL keys, i.e.
+        min(pos, Lc) on the host: 0 on the first step, Lc once the window has
+        wrapped. The cache is a rolling window, so the real slots are always the
+        LAST cache_valid ones; the never-written ones are all-zero keys, whose
+        score is 0 (not -inf), so they would steal softmax mass. A boolean
+        'any history' flag instead of this count is only true at step 0, so every
+        later step leaks Lc - B phantom keys into the softmax: measured stepwise
+        SNR 10.2 dB at B=16 (40 of 87 keys phantom) against 48.8 dB at B=64
+        (7 of 79). The bias is built with Sub/Clip/Mul on a [Lc] constant grid —
+        no comparison/Where, and no reduction over the 1.3 MB cache tensor,
+        whose Abs/ReduceSum/Clip version costs 30 dB of NPU fp16 accuracy."""
         dec = self.dec
         B = self.B
         c = self._split(flat_cache)
@@ -200,8 +214,7 @@ class StatefulDecoder(torch.nn.Module):
             parts.append(v_full[:, -self.Lc:].reshape(-1))
             att = torch.softmax(
                 q[None] @ k_full[None].transpose(2, 3) * self.scaling
-                + self.attn_mask
-                + self.hist_ind * (cache_valid - 1.0) * 100.0, dim=-1)
+                + self.attn_mask + self._slot_bias(cache_valid), dim=-1)
             o = (att @ v_full[None]).transpose(1, 2).reshape(1, B, -1)
             hidden = res + layer.self_attn_layer_scale(a.o_proj(o))
             hidden = hidden + layer.mlp_layer_scale(
@@ -286,8 +299,7 @@ def main():
         for i in range(0, n, B):
             L = min(B, n - i)
             wav, flat = sdec(codes[:, :, i:i + L], rope(i, L),
-                             flat.new_zeros(1) if i == 0 else flat.new_ones(1),
-                             flat)
+                             np.float32(min(i, sdec.Lc)), flat)
             outs.append(wav)
         step = torch.cat(outs)
 
@@ -311,8 +323,10 @@ def main():
     f0 = rope(0, B)
     dummy_cache = torch.zeros(sdec.cache_numel, dtype=torch.float32)
     print(f"exporting {out} ...")
+    # cache_valid is traced as a dynamic input; trace it at a mid-range value so
+    # no branch of the phantom-slot clamp degenerates into a constant.
     torch.onnx.export(
-        sdec, (dummy_c, f0, torch.ones(1), dummy_cache), out,
+        sdec, (dummy_c, f0, torch.full((1,), float(B)), dummy_cache), out,
         input_names=["audio_codes", "freqs_in", "cache_valid", "cache_in"],
         output_names=["audio_values", "cache_out"],
         opset_version=args.opset,
@@ -332,7 +346,7 @@ def main():
         w, flat = sess.run(None, {
             "audio_codes": codes[:, :, i:i + L].numpy(),
             "freqs_in": rope(i, L).numpy(),
-            "cache_valid": (np.zeros if i == 0 else np.ones)(1, np.float32),
+            "cache_valid": np.full(1, min(i, sdec.Lc), dtype=np.float32),
             "cache_in": flat})
         outs.append(w.reshape(-1)[:L * 1920])
     onnx_step = np.concatenate(outs)
